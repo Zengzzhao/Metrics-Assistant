@@ -1,0 +1,24 @@
+# 修改此文件后执行 make run/start/inspect/resume/continue，无需重复传命令行参数。
+[run]
+# 处理markdown文件路径
+input = "data/MinerU_markdown_-index_and_its_variants__a_set_of_overall_scholarly_expertise_diversity_indices_for_the_research_portfolio_management_of_institutions_2098605842830221312.md"
+# 输出产物路径
+output = "outputs"
+# 运行模式
+action = "run"
+pattern = "*.md"
+model = "deepseek-flash"
+max_output_tokens = 16000
+max_chars = 250000
+max_images = 40
+max_body_bytes = 40000000
+timeout = 180
+
+# checkoutpoint数据库路径
+db = ".debug/checkpoints.sqlite"
+# 每个checkoutpint的id
+thread_id = "paper-001"
+# start/resume 每次执行到下一个指定节点后暂停；[] 表示运行到结束。
+stop_after = ["prepare_document", "classify_images", "discover_indicators"]
+# inspect 要查看的数据：all/document/discovery/extraction
+field = "all"
