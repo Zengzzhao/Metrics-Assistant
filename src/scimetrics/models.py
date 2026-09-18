@@ -71,21 +71,6 @@ class Grounded(StrictModel):
         return self
 
 
-class Formula(StrictModel):
-    indicator_id: str
-    latex_raw: str
-    equation_label: str | None = None
-    variables: dict[str, str] = Field(default_factory=dict)
-    conditions: str | None = None
-    evidence: list[Evidence] = Field(min_length=1)
-
-
-class Limitation(Grounded):
-    indicator_id: str
-    summary: str
-    attribution: Literal["current_authors", "cited_authors", "model_inference"]
-
-
 class PaperRelation(Grounded):
     indicator_id: str
     predicate: Literal["PROPOSES", "MODIFIES", "APPLIES"]
@@ -104,36 +89,3 @@ class PaperRelations(StrictModel):
 
 class IndicatorRelations(StrictModel):
     indicator_relations: list[IndicatorRelation]
-
-# ========信息节点输出========
-class Extraction(StrictModel):
-    indicators: list[Indicator]
-    formulas: list[Formula]
-    reported_limitations: list[Limitation]
-    inferred_limitations: list[Limitation]
-    paper_relations: list[PaperRelation]
-    indicator_relations: list[IndicatorRelation]
-
-    @model_validator(mode="after")
-    def validate_references(self):
-        ids = [i.indicator_id for i in self.indicators]
-        if len(ids) != len(set(ids)):
-            raise ValueError("指标 ID 重复")
-        known = set(ids)
-        for group in (self.formulas, self.reported_limitations, self.inferred_limitations,
-                      self.paper_relations):
-            for item in group:
-                if item.indicator_id not in known:
-                    raise ValueError(f"未知指标 ID: {item.indicator_id}")
-        for rel in self.indicator_relations:
-            if rel.subject_id not in known or rel.object_id not in known:
-                raise ValueError("指标关系引用未知实体")
-            if rel.subject_id == rel.object_id:
-                raise ValueError("指标不能与自己建立目标关系")
-        for item in self.reported_limitations:
-            if item.assertion_mode != "explicit" or item.attribution == "model_inference":
-                raise ValueError("reported_limitations 只能是文献明示评价")
-        for item in self.inferred_limitations:
-            if item.assertion_mode != "inferred" or item.attribution != "model_inference":
-                raise ValueError("inferred_limitations 必须标记模型推断")
-        return self

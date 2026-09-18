@@ -8,17 +8,19 @@ output = "outputs"
 action = "run"
 pattern = "*.md"
 model = "deepseek-flash"
-max_output_tokens = 16000
+max_output_tokens = 65536
 max_chars = 250000
 max_images = 40
 max_body_bytes = 40000000
-timeout = 180
+timeout = 600
 
 # checkoutpoint数据库路径
 db = ".debug/checkpoints.sqlite"
 # 每个checkoutpint的id
 thread_id = "paper-001"
-# start/resume 每次执行到下一个指定节点后暂停；[] 表示运行到结束。
-stop_after = ["prepare_document", "classify_images", "plan_chunks", "discover_chunks", "merge_indicators", "extract_pi_relation"]
+# resume 遵循前/后暂停点；continue 忽略全部暂停点，但仍逐章保存。
+# 不在 discover_chunks 后暂停，全部章节处理完后停在 merge_indicators 前。
+stop_after = ["prepare_document", "classify_images", "plan_chunks", "merge_indicators", "extract_pi_relation"]
+stop_before = ["merge_indicators"]
 # inspect：all/raw_content/images/chunks/skipped_sections/chunk_discoveries/discovery/merge_map/paper_relations/indicator_relations/extraction
 field = "all"

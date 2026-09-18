@@ -59,7 +59,7 @@ def unique(values):
     return result
 
 
-def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_after=None):
+def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_after=None, interrupt_before=None):
     def prepare(state):
         source = settings.input_path.resolve()
         if source.suffix.lower() != ".md" or not source.is_file():
@@ -82,7 +82,7 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
 
     def plan(state):
         chunks, skipped = plan_sections(state["raw_content"], state["images"])
-        return {"chunks": chunks, "skipped_sections": skipped}
+        return {"chunks": chunks, "skipped_sections": skipped, "chunk_discoveries": []}
 
     def content(state, chunk=None):
         bounds = {"start": chunk["start"], "end": chunk["end"]} if chunk else {}
@@ -109,22 +109,27 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
             raise ValueError(f"{error}\n诊断报告与抽取结果：{path.resolve()}") from error
 
     def discover(state):
-        records = []
-        # 每个章节chunk单独发现指标
-        for chunk in state["chunks"]:
-            parts = content(state, chunk)
-            result = client.call(
-                "discover_" + chunk["chunk_id"], prompts.DISCOVER, parts, Discovery
-            )
-            data = result.model_dump()
-            validate(data, state, parts, "discover_" + chunk["chunk_id"], chunk)
-            # 指标的编号由程序统一分配为Cxxx_Ixxx，避免不同章节都返回 I001 时冲突。
-            for index, indicator in enumerate(data["indicators"], 1):
-                indicator["indicator_id"] = f"{chunk['chunk_id']}_I{index:03d}"
-            records.append(
-                {"chunk_id": chunk["chunk_id"], "title": chunk["title"], **data}
-            )
-        return {"chunk_discoveries": records}
+        records = state["chunk_discoveries"]
+        chunks = state["chunks"]
+        if [r["chunk_id"] for r in records] != [c["chunk_id"] for c in chunks[:len(records)]]:
+            raise ValueError("已保存的章节结果与章节清单不一致，不能继续发现")
+        if len(records) == len(chunks):
+            return {"chunk_discoveries": records}
+        chunk = chunks[len(records)]
+        parts = content(state, chunk)
+        stage = "discover_" + chunk["chunk_id"]
+        result = client.call(stage, prompts.DISCOVER, parts, Discovery)
+        data = result.model_dump()
+        validate(data, state, parts, stage, chunk)
+        for index, indicator in enumerate(data["indicators"], 1):
+            indicator["indicator_id"] = f"{chunk['chunk_id']}_I{index:03d}"
+        record = {"chunk_id": chunk["chunk_id"], "title": chunk["title"], **data}
+        # 不修改传入状态。只有请求、结构校验、证据校验全部成功才提交本章。
+        return {"chunk_discoveries": [*records, record]}
+
+    def after_discover(state):
+        return ("discover_chunks" if len(state["chunk_discoveries"]) < len(state["chunks"])
+                else "merge_indicators")
 
     def merge(state):
         candidates = {
@@ -183,13 +188,6 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
                     ),
                     "definitions": unique(
                         [m["definition"] for m in members if m["definition"]]
-                    ),
-                    "evaluation_objects": unique(
-                        [
-                            m["evaluation_object"]
-                            for m in members
-                            if m["evaluation_object"]
-                        ]
                     ),
                     "evidence": unique([e for m in members for e in m["evidence"]]),
                     "source_chunk_ids": unique([m["chunk_id"] for m in members]),
@@ -265,7 +263,11 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
     previous = START
     for name, node in nodes.items():
         graph.add_node(name, node)
-        graph.add_edge(previous, name)
+        if previous != "discover_chunks":
+            graph.add_edge(previous, name)
         previous = name
+    graph.add_conditional_edges("discover_chunks", after_discover,
+                                ["discover_chunks", "merge_indicators"])
     graph.add_edge(previous, END)
-    return graph.compile(checkpointer=checkpointer, interrupt_after=interrupt_after)
+    return graph.compile(checkpointer=checkpointer, interrupt_after=interrupt_after,
+                         interrupt_before=interrupt_before)

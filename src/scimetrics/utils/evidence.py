@@ -8,10 +8,28 @@ _MATH = re.compile(r"\$\$.*?\$\$|(?<!\\)\$(?!\$)(?:\\.|[^$])*?(?<!\\)\$|\\\(.*?\
 
 
 def normalize(value: str) -> str:
-    # 只在有数学定界符的片段中忽略 LaTeX 命令与左花括号之间的空白。
-    # 不删普通词间空格，不做公式等价变换，不改符号、数值、下标或标点。
-    value = _MATH.sub(lambda match: re.sub(r"(\\[A-Za-z]+)\s+(?=\{)", r"\1", match.group()), value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_math(value: str) -> str:
+    # 仅忽略 LaTeX 命令与左花括号间空白，不改词间空格或数学符号。
+    return re.sub(r"(\\[A-Za-z]+)\s+(?=\{)", r"\1", value)
+
+
+def quote_matches(quote: str, raw: str) -> bool:
+    query = normalize(quote)
+    if not query:
+        return False
+    # 优先原文匹配，避免规范化反而破坏本来完全一致的引句。
+    if query in normalize(raw):
+        return True
+    # 两侧都包含数学定界符的混合正文引句。
+    source = normalize(_MATH.sub(lambda m: normalize_math(m.group()), raw))
+    if normalize(_MATH.sub(lambda m: normalize_math(m.group()), quote)) in source:
+        return True
+    # 模型可能仅引用公式内部，不带 $/$$；仅在原文数学区域内比较。
+    math_query = normalize(normalize_math(quote))
+    return any(math_query in normalize(normalize_math(m.group())) for m in _MATH.finditer(raw))
 
 
 def whitespace_map(raw: str):
@@ -70,7 +88,6 @@ class EvidenceValidationError(ValueError):
 
 def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', source_path=None,
                    chunk=None, full_raw=None):
-    original = normalize(raw_content)
     visual_urls = {p['image_url']['url'] for p in parts if p['type'] == 'image_url'}
     errors = []
     source_start = chunk['start'] if chunk else 0
@@ -83,7 +100,7 @@ def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', sour
                 quote = value['quote']
                 reason = None
                 if value['kind'] == 'text':
-                    if not isinstance(quote, str) or not normalize(quote) or normalize(quote) not in original:
+                    if not isinstance(quote, str) or not quote_matches(quote, raw_content):
                         reason = 'text_quote_not_found'
                 elif quote not in visual_urls:
                     reason = 'visual_url_not_supplied'
@@ -94,7 +111,7 @@ def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', sour
                              'kind': value['kind'], 'quote': quote}
                     if value['kind'] == 'text' and isinstance(quote, str):
                         error['nearest_source'] = nearest_excerpt(quote, raw_content, source_start, full_raw)
-                        if full_raw is not None and normalize(quote) and normalize(quote) in normalize(full_raw):
+                        if full_raw is not None and quote_matches(quote, full_raw):
                             error['found_elsewhere_in_full_document'] = True
                     else:
                         error['supplied_image_urls'] = sorted(visual_urls)

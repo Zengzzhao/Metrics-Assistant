@@ -46,7 +46,8 @@ flowchart LR
     A[prepare_document] --> B[classify_images]
     B --> C[plan_chunks]
     C --> D[discover_chunks]
-    D --> E[merge_indicators]
+    D -->|还有章节| D
+    D -->|全部完成| E[merge_indicators]
     E --> F[extract_pi_relation]
     F --> G[extract_ii_relation]
 ```
@@ -54,18 +55,18 @@ flowchart LR
 1. **prepare_document**：读取原文并识别图片 URL、编号和字符位置。
 2. **classify_images**：逐张仅发送 image_url，系统提示词说明科学/非科学二分类任务。不发送正文、图注或 alt。
 3. **plan_chunks**：Markdown 一级、二级标题均作为独立章节边界（不猜测被 MinerU 扁平化的子标题层级）。过滤 References、Bibliography、Funding、Acknowledgements、Author contributions、Conflict of interest 及常见拼写变体；其他章节默认保留，包含 Abstract、Appendix。只有标题没有正文的章节过滤，只有科学图片的章节保留。记录跳过原因。正文和位置不改写。
-4. **discover_chunks**：每个保留章节单独调用模型。正文和科学图片按原文顺序发送，非科学图片语法跳过。程序分配全局唯一候选 ID，如 C0002_I001。章节超过配置上限时报错，不自行截断或再拆分。每章结果保存在 State 的 chunk_discoveries。
+4. **discover_chunks**：每个保留章节单独调用模型。正文和科学图片按原文顺序发送，非科学图片语法跳过。程序分配全局唯一候选 ID，如 C0002_I001。章节超过配置上限时报错，不自行截断或再拆分。每次节点执行只处理一章，成功后将结果追加到 State 的 chunk_discoveries；检查点模式在下一章开始前同步保存。失败时重试当前章节，已完成章节不重复调用。
 5. **merge_indicators**：模型根据候选名称、定义与原始证据输出归并分组；程序要求每个候选恰好属于一组，不确定则分开。按组分配 I001 等统一 ID，程序合并别名、定义、评价对象、证据及来源章节，保留 merge_map。不让模型重新生成证据。零候选或单候选不发起归并模型调用。
 6. **extract_pi_relation**：原始全文（包括参考文献）＋科学图片＋固定指标清单，独立抽取 PROPOSES/MODIFIES/APPLIES。参考文献仅辅助归因，不把他人成果归给本文。无指标时返回空列表。
-7. **extract_ii_relation**：相同全文多模态输入＋指标清单，独立抽取 VARIANT_OF/DERIVED_FROM/IMPROVES/ALTERNATIVE_TO/COMPONENT_OF；不足两个指标时返回空列表。完成后写 result.json。
+7. **extract_ii_relation**：相同全文多模态输入＋指标清单，独立抽取 VARIANT_OF/DERIVED_FROM/IMPROVES_ON/ALTERNATIVE_TO/COMPONENT_OF；不足两个指标时返回空列表。完成后写 result.json。
 
-关系节点只使用已归并的指标 ID；不在两个关系调用中分别新增实体，避免 ID 不一致。当前流程按本次要求专注指标和两类关系，不再调用旧的公式/局限性统一抽取节点。
+关系节点只使用已归并的指标 ID；不在两个关系调用中分别新增实体，避免 ID 不一致。当前流程按本次要求专注指标和两类关系，当前未实现公式/局限性抽取。
 
 ## 输出与失败诊断
 
 每篇输出路径：`outputs/文件名-路径哈希/result.json`。
 
-字段包括 indicators、merge_map、paper_relations、indicator_relations、chunks、skipped_sections、status。指标保留 definitions/evaluation_objects 列表以避免丢弃不同章节表述。
+字段包括 indicators、merge_map、paper_relations、indicator_relations、chunks、skipped_sections、status。指标保留 definitions 列表以避免丢弃不同章节表述。
 
 证据不再包含 source_id。文字 quote 直接在原始 chunk（关系阶段为原始全文）匹配，允许空白差异，不在候选清单或提示词里匹配。视觉 quote 保存完整图片 URL，observation 描述区域及所见；URL 必须属于本次实际发送的图片。消息不添加 B/F 编号，仅按图片位置组织前文 text → image_url → 后文 text，不插入图片来源 URL 说明块。视觉证据 URL 直接与本次 image_url.url 比较。内部 figure_id 仅用于分类追踪。来源校验不代表语义正确，结果仍标记 extracted_unverified。
 
@@ -73,7 +74,7 @@ flowchart LR
 
 提示词在 `src/scimetrics/prompts.py`，schema 在 `src/scimetrics/models.py`。每次调用使用系统提示词加 JSON Schema，用户消息为文本/图片数组；JSON mode 后仍有 Pydantic 结构校验。默认模型 deepseek-flash。
 
-run.toml 默认配置为 `max_chars = 250000`、`max_images = 40`（过滤后图片数）、`max_body_bytes = 40000000`、`max_output_tokens = 16000`。超限或输出截断会停止该篇，不静默裁剪。字符数不是精确 token 计数。HTTP 请求超时 `timeout = 180` 秒，SDK 最多重试 2 次，没有语义修复与本地缓存。
+run.toml 默认配置为 `max_chars = 250000`、`max_images = 40`（过滤后图片数）、`max_body_bytes = 40000000`、`max_output_tokens = 65536`。超限或输出截断会停止该篇，不静默裁剪。字符数不是精确 token 计数。HTTP 请求超时 `timeout = 600` 秒，SDK 最多重试 2 次，没有语义修复与本地缓存。
 
 ## LangSmith
 
@@ -102,8 +103,9 @@ action = "run"
 model = "deepseek-flash"
 db = ".debug/checkpoints.sqlite"
 thread_id = "paper-001"
-stop_after = ["prepare_document", "classify_images", "plan_chunks", "discover_chunks", "merge_indicators"]
-field = "document"
+stop_after = ["prepare_document", "classify_images", "plan_chunks", "merge_indicators"]
+stop_before = ["merge_indicators"]
+field = "all"
 ```
 
 TOML 中的相对路径相对于配置文件目录，程序也从该目录加载 .env；已有环境变量优先。--config 的相对路径相对于当前工作目录。直接 `uv run scimetrics` 会读取当前目录的 run.toml。使用其他配置：`make run CONFIG=another.toml`。
@@ -111,13 +113,13 @@ TOML 中的相对路径相对于配置文件目录，程序也从该目录加载
 | 命令 | 行为 |
 | --- | --- |
 | `make install` | 安装项目依赖 |
-| `make run` | 全流程执行，不启用检查点，忽略 stop_after |
+| `make run` | 全流程执行，不启用检查点，忽略 stop_after 和 stop_before |
 | `make start` | 新建检查点任务，到第一个指定断点暂停 |
 | `make inspect` | 查看 SQLite 中已保存的 State，不执行模型调用 |
 | `make resume` | 从检查点继续，到下一个指定断点暂停 |
-| `make continue` | 从检查点执行全部剩余节点，忽略 stop_after |
+| `make continue` | 从检查点执行全部剩余节点，忽略 stop_after 和 stop_before |
 
-例如：make start → make inspect → make resume → make inspect → make continue。inspect 显示的 next 是将要执行的节点，state 由 field 选择。stop_after=[] 表示不设置断点。图片分类循环在同一节点内，只能在整批图片分类后暂停。
+例如：make start → make inspect → make resume → make inspect → make continue。inspect 显示的 next 是将要执行的节点，state 由 field 选择。stop_after=[] 且 stop_before=[] 表示不设置断点。图片分类循环在同一节点内，只能在整批图片分类后暂停。
 
 ## 统一 CLI 与检查点恢复
 
@@ -130,7 +132,7 @@ uv run scimetrics --config run.toml --action resume
 uv run scimetrics --config run.toml --action continue
 ```
 
-首次 start 保存输入绝对路径、输出路径、模型及限额到同一 SQLite，后续 resume 使用已保存的配置；修改 run.toml 中模型或输入路径不会改变已有任务。要应用新配置，换一个 thread_id 并 start。resume 时的 db、thread_id、stop_after 以及 inspect 的 field 则使用当前配置。
+首次 start 保存输入绝对路径、输出路径、模型及初始限额到同一 SQLite。后续 resume 固定使用已保存的输入、输出和模型，但 max_output_tokens、timeout、max_chars、max_images、max_body_bytes 使用当前 run.toml 的值，并打印实际限额；因此输出截断后可以提高限额直接恢复。更换输入或模型需新 thread_id 并 start。db、thread_id、stop_after、stop_before 以及 inspect 的 field 使用当前配置。
 
 成功运行仅保存最终 JSON；证据校验失败时额外保存 evidence_errors 下的诊断报告与抽取响应。检查点模式额外保存 SQLite 数据库（默认 .debug/checkpoints.sqlite，已忽略提交），支持退出程序后继续。不要并发操作相同 thread_id。跨工作目录运行应指定相同配置文件或数据库绝对路径。
 
@@ -138,32 +140,15 @@ prepare_document 不调用模型，不需要 DeepSeek Key。inspect 不启用云
 
 完成后 next 为空；再次 resume 不重复执行。extract_ii_relation 后暂停时 result.json 已保存。节点中途失败恢复会重跑失败节点，可能重复已发出的 API 请求。程序仅保存节点边界检查点，不能在图片分类循环内部逐图恢复。
 
-`discover_chunks` 同样在一个节点内部循环：只有全部章节成功后，`chunk_discoveries` 才写入 State。中间章节报错时，`make resume` 会从第一个章节重新执行发现，保留之前已完成的图片分类和章节划分。LangSmith 的调用记录用于诊断，不会自动成为可恢复的章节状态。若需要逐章恢复，需将每章处理改为独立图执行步，并在每步保存结果和进度；无法追溯补出本次没有保存的章节检查点。
+`discover_chunks` 现在每次执行一章，由条件边返回自身或进入 merge_indicators。成功章节（包括未发现指标的章节）写入 chunk_discoveries，其长度就是已完成进度。请求、结构或证据校验失败时不提交本章，resume 重试这一章。inspect 的 discovery_progress 显示已完成/总章节数。stop_after 包含 discover_chunks 时，每成功一章暂停一次；make continue 忽略暂停点，仍逐章同步保存。make run 不启用检查点，无法跨进程恢复。
+
+仅支持当前 State 结构，不提供旧检查点迁移。更新前未包含 chunk_discoveries 的任务请更换 thread_id 后 make start；检查点数据库和已有结果不会被自动删除。LangSmith 的调用记录用于诊断，不会自动成为可恢复状态。图片分类仍为整批处理。图执行步数上限为 10000，避免章节循环触发默认的较小步数上限。
+
+make resume 遵循 stop_after 和 stop_before。当前配置保留准备、分类、划分及归并后的暂停点，移除 discover_chunks 后的暂停点，并在 merge_indicators 前暂停：从 plan_chunks 完成处恢复，将处理全部剩余章节后停在归并前，再次 resume 执行归并并在归并后暂停。若将 discover_chunks 加回 stop_after，则每章暂停。make continue 临时清空前后暂停点，运行到结束或报错，仍逐章保存。
 
 LangGraph 支持读取 `graph.get_state_history(config)`，选择历史快照后用 `graph.invoke(None, snapshot.config)` 从该快照继续执行。快照表示节点执行后的状态，因此要重新执行某节点，应选它执行前的快照（`next` 包含该节点）。这会重放后续节点并形成分支，不删除历史，不撤销模型调用费用或已写文件。目前 CLI 的 resume 只读取最新检查点，尚未提供选择历史 checkpoint_id 的入口。详见 [LangGraph time travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel)。
 
 项目不包含测试目录或 pytest 依赖。
-
-### 轻量状态（2026-09-15）
-
-`classify_images` 返回更新后的 `images`，不修改 `raw_content` 或旧检查点。
-下游临时按原文位置构建消息：图片前文本 → 科学图片 image_url → 后续文本；装饰图片语法跳过。
-重复科学图片在每个原文位置发送，计入 max_images；正文不添加内容块编号。
-支持 Markdown 普通/引用式图片和 HTML img，跳过代码块、行内代码及转义图片语法。
-图片仍只接受 HTTP(S) URL，未改动已有资源输入约束。
-
-检查状态可配置 `field = "raw_content"` 或 `field = "images"`；旧 `field = "document"` 作为兼容查看入口返回这两个字段。
-本次状态结构已变化，旧任务请用新 thread_id 重新 start，不要从旧 document 检查点继续。
-
-后续改动不新增测试文件，使用语法检查和必要的运行检查验证。
-
-### 章节流程迁移
-
-节点结构已变化，请使用新的 thread_id 执行 start，旧检查点不能直接恢复。run.toml 的 input、模型和其他用户参数不变。field 支持 chunks、skipped_sections、chunk_discoveries、merge_map、paper_relations、indicator_relations。逐章调用目前在 discover_chunks 一个节点内执行，节点中途失败恢复会重做本节点，不会把失败章节当作无指标。章节过滤仅作用于发现阶段，两个关系节点仍输入原始全文。全文超限仍停止，需要调整限额或另行设计长文关系抽取。
-
-### 证据格式迁移
-
-证据 schema 已更新，旧检查点/结果包含 source_id，不与本版直接兼容；请换新的 thread_id 重新 start。
 
 ### 证据校验失败诊断
 
@@ -172,3 +157,5 @@ LangGraph 支持读取 `graph.get_state_history(config)`，选择历史快照后
 失败详情和完整抽取响应保存到每篇输出目录的 `evidence_errors/<stage>.json`，方便不重调 API 就检查失败内容。重复失败会覆盖该阶段的旧报告；已存在的报告是历史诊断，不表示本轮仍失败。
 
 文字匹配忽略连续空白差异；仅在 `$...$`、`$$...$$`、`\(...\)`、`\[...\]` 数学片段内，进一步忽略 LaTeX 命令与左花括号间的空白，例如 `\operatorname {cit}` 与 `\operatorname{cit}`。不做公式等价推断，也不忽略标点、符号或数值差异。
+
+公式证据先进行仅折叠空白的原文匹配，避免规范化破坏已有匹配；对于不带数学定界符的公式引句，额外在原文数学片段内使用相同的 LaTeX 空白规范化规则比较。原始引句和原文不改写，近似匹配仍只用于诊断。

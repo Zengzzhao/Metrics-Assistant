@@ -30,25 +30,26 @@ class RunConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     input: Path
-    output: Path = Path("outputs")
+    output: Path = Path(".debug")
     action: Literal["run", "start", "resume", "inspect", "continue"] = "run"
     pattern: str = "*.md"
     model: str = "deepseek-flash"
-    max_output_tokens: int = Field(default=16000, gt=0, strict=True)
+    max_output_tokens: int = Field(default=65536, gt=0, strict=True)
     max_chars: int = Field(default=250000, gt=0, strict=True)
     max_images: int = Field(default=40, ge=0, strict=True)
     max_body_bytes: int = Field(default=40000000, gt=0, strict=True)
-    timeout: float = Field(default=180, gt=0)
+    timeout: float = Field(default=600, gt=0)
     db: Path = Path(".debug/checkpoints.sqlite")
     thread_id: str = Field(default="paper-001", pattern=r"\S")
     stop_after: list[NodeName] = Field(
         default_factory=lambda: [
             "prepare_document",
             "classify_images",
-            "plan_chunks", "discover_chunks", "merge_indicators",
+            "plan_chunks", "merge_indicators",
         ]
     )
-    field: Literal["all", "document", "raw_content", "images", "chunks", "skipped_sections",
+    stop_before: list[NodeName] = Field(default_factory=lambda: ["merge_indicators"])
+    field: Literal["all", "raw_content", "images", "chunks", "skipped_sections",
                    "chunk_discoveries", "discovery", "merge_map", "paper_relations",
                    "indicator_relations", "extraction"] = "all"
 
@@ -81,7 +82,7 @@ def load_config(path: Path, action=None):
     if action:
         config.action = action
     if config.action == "continue":
-        config.action, config.stop_after = "resume", []
+        config.action, config.stop_after, config.stop_before = "resume", [], []
     return config
 
 # 执行编排流程
@@ -90,13 +91,20 @@ def execute(graph, initial, name, thread_id=None):
         "run_id": uuid4(),
         "run_name": name,
         "tags": ["scimetrics"],
+        # 每章占一个图执行步；循环仍由有限的章节清单决定结束。
+        "recursion_limit": 10000,
     }
     if thread_id:
         config["configurable"] = {"thread_id": thread_id}
-    for update in graph.stream(initial, config=config, stream_mode="updates"):
+    for update in graph.stream(initial, config=config, stream_mode="updates", durability="sync"):
         for node in update:
             if node != "__interrupt__":
-                print(f"[{name}] {node}", flush=True)
+                detail = ""
+                if node == "discover_chunks":
+                    records = update[node]["chunk_discoveries"]
+                    if records:
+                        detail = f"：已完成 {len(records)} 章，最新 {records[-1]['chunk_id']} {records[-1]['title']}"
+                print(f"[{name}] {node}{detail}", flush=True)
 
 
 class LazyClient:
@@ -167,11 +175,22 @@ def run_checkpoint(args):
                     raise ValueError(
                         "原始 Markdown 已变化或不存在，请使用新 thread-id 重新 start"
                     )
+        # 输入、输出和模型固定；恢复时允许用当前配置调整资源限额。
+        client_options = dict(saved["client"])
+        if args.action == "resume":
+            settings.max_chars = args.max_chars
+            settings.max_images = args.max_images
+            settings.max_body_bytes = args.max_body_bytes
+            client_options.update(max_tokens=args.max_output_tokens, timeout=args.timeout)
+            print(f"[LIMITS] max_output_tokens={args.max_output_tokens}, timeout={args.timeout}s, "
+                  f"max_chars={settings.max_chars}, max_images={settings.max_images}, "
+                  f"max_body_bytes={settings.max_body_bytes}", flush=True)
         graph = build_graph(
             settings,
-            LazyClient(saved["client"]),
+            LazyClient(client_options),
             checkpointer=SqliteSaver(connection),
             interrupt_after=args.stop_after or None,
+            interrupt_before=args.stop_before or None,
         )
         config = {"configurable": {"thread_id": args.thread_id}}
         if args.action != "inspect":
@@ -194,13 +213,16 @@ def run_checkpoint(args):
             "next": list(snapshot.next),
             "state_keys": list(snapshot.values),
             "output": str(settings.output_dir / "result.json"),
+            "discovery_progress": {
+                "completed": len(snapshot.values.get("chunk_discoveries", [])),
+                "total": len(snapshot.values.get("chunks", [])),
+            },
         }
         if args.action == "inspect":
             report["state"] = (
                 snapshot.values
                 if args.field == "all"
-                else ({k: snapshot.values.get(k) for k in ("raw_content", "images")}
-                      if args.field == "document" else snapshot.values.get(args.field))
+                else snapshot.values.get(args.field)
             )
             report["tasks"] = [
                 {"name": task.name, "error": str(task.error) if task.error else None}
