@@ -14,14 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from .client import DeepSeekClient
-from .document import digest
-from .observability import validate_tracing, flush_traces
+from .utils.client import DeepSeekClient
+from .utils.document import digest
+from .utils.observability import validate_tracing, flush_traces
 from .pipeline import Settings, build_graph
-from .prompts import PROMPT_VERSION
 
 NodeName = Literal[
-    "prepare_document", "classify_images", "discover_indicators", "extract_information"
+    "prepare_document", "classify_images", "plan_chunks", "discover_chunks",
+    "merge_indicators", "extract_pi_relation", "extract_ii_relation"
 ]
 
 
@@ -45,10 +45,12 @@ class RunConfig(BaseModel):
         default_factory=lambda: [
             "prepare_document",
             "classify_images",
-            "discover_indicators",
+            "plan_chunks", "discover_chunks", "merge_indicators",
         ]
     )
-    field: Literal["all", "document", "raw_content", "images", "discovery", "extraction"] = "all"
+    field: Literal["all", "document", "raw_content", "images", "chunks", "skipped_sections",
+                   "chunk_discoveries", "discovery", "merge_map", "paper_relations",
+                   "indicator_relations", "extraction"] = "all"
 
     def settings(self, source=None, output=None):
         return Settings(
@@ -88,7 +90,6 @@ def execute(graph, initial, name, thread_id=None):
         "run_id": uuid4(),
         "run_name": name,
         "tags": ["scimetrics"],
-        "metadata": {"prompt_version": PROMPT_VERSION},
     }
     if thread_id:
         config["configurable"] = {"thread_id": thread_id}
@@ -140,7 +141,6 @@ def run_checkpoint(args):
                 },
                 "client": args.client_options(),
                 "input_hash": digest(source.read_bytes()),
-                "prompt_version": PROMPT_VERSION,
             }
             connection.execute(
                 "INSERT INTO debug_sessions VALUES (?, ?)",
@@ -160,8 +160,6 @@ def run_checkpoint(args):
                 }
             )
             if args.action == "resume":
-                if saved["prompt_version"] != PROMPT_VERSION:
-                    raise ValueError("提示词版本已变化，请新建调试任务")
                 if (
                     not settings.input_path.is_file()
                     or digest(settings.input_path.read_bytes()) != saved["input_hash"]

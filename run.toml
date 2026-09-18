@@ -19,6 +19,6 @@ db = ".debug/checkpoints.sqlite"
 # 每个checkoutpint的id
 thread_id = "paper-001"
 # start/resume 每次执行到下一个指定节点后暂停；[] 表示运行到结束。
-stop_after = ["prepare_document", "classify_images", "discover_indicators"]
-# inspect 要查看的数据：all/document/discovery/extraction
+stop_after = ["prepare_document", "classify_images", "plan_chunks", "discover_chunks", "merge_indicators", "extract_pi_relation"]
+# inspect：all/raw_content/images/chunks/skipped_sections/chunk_discoveries/discovery/merge_map/paper_relations/indicator_relations/extraction
 field = "all"

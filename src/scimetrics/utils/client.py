@@ -21,6 +21,12 @@ class DeepSeekClient:
             timeout=timeout, max_retries=2))
 
     def call(self, stage: str, prompt: str, content: list, schema: type[BaseModel]):
+        """
+        stage: 用于追踪的阶段名称
+        prompt: 系统提示词
+        content: 用户问题内容
+        schema: 用于验证 JSON 的 Pydantic 模型类
+        """
         system = prompt + "\n输出 JSON Schema：\n" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
         extra = {"langsmith_extra": {"name": f"deepseek:{stage}", "run_id": str(uuid4()),
                  "metadata": {"stage": stage}}} if tracing_enabled() else {}
