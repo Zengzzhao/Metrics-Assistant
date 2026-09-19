@@ -9,6 +9,7 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from . import prompts
+from .utils.merge import validate_merge_plan
 from .utils.evidence import EvidenceValidationError, check_evidence
 from .utils.document import (
     build_content,
@@ -59,7 +60,14 @@ def unique(values):
     return result
 
 
-def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_after=None, interrupt_before=None):
+def build_graph(
+    settings: Settings,
+    client,
+    *,
+    checkpointer=None,
+    interrupt_after=None,
+    interrupt_before=None,
+):
     def prepare(state):
         source = settings.input_path.resolve()
         if source.suffix.lower() != ".md" or not source.is_file():
@@ -97,21 +105,31 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
 
     def validate(data, state, parts, stage, chunk=None):
         raw = state["raw_content"]
-        scope = raw[chunk["start"]:chunk["end"]] if chunk else raw
+        scope = raw[chunk["start"] : chunk["end"]] if chunk else raw
         try:
-            check_evidence(data, scope, parts, stage=stage,
-                           source_path=str(settings.input_path.resolve()),
-                           chunk=chunk, full_raw=raw)
+            check_evidence(
+                data,
+                scope,
+                parts,
+                stage=stage,
+                source_path=str(settings.input_path.resolve()),
+                chunk=chunk,
+                full_raw=raw,
+            )
         except EvidenceValidationError as error:
             # 仅失败时保存完整响应和诊断；无请求正文、Base64 或密钥。
             path = settings.output_dir / "evidence_errors" / f"{stage}.json"
             write_json(path, {"report": error.report, "extraction": data})
-            raise ValueError(f"{error}\n诊断报告与抽取结果：{path.resolve()}") from error
+            raise ValueError(
+                f"{error}\n诊断报告与抽取结果：{path.resolve()}"
+            ) from error
 
     def discover(state):
         records = state["chunk_discoveries"]
         chunks = state["chunks"]
-        if [r["chunk_id"] for r in records] != [c["chunk_id"] for c in chunks[:len(records)]]:
+        if [r["chunk_id"] for r in records] != [
+            c["chunk_id"] for c in chunks[: len(records)]
+        ]:
             raise ValueError("已保存的章节结果与章节清单不一致，不能继续发现")
         if len(records) == len(chunks):
             return {"chunk_discoveries": records}
@@ -128,8 +146,11 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
         return {"chunk_discoveries": [*records, record]}
 
     def after_discover(state):
-        return ("discover_chunks" if len(state["chunk_discoveries"]) < len(state["chunks"])
-                else "merge_indicators")
+        return (
+            "discover_chunks"
+            if len(state["chunk_discoveries"]) < len(state["chunks"])
+            else "merge_indicators"
+        )
 
     def merge(state):
         candidates = {
@@ -137,8 +158,10 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
             for d in state["chunk_discoveries"]
             for i in d["indicators"]
         }
+        # 如果没有候选指标，直接返回空发现和空归并映射
         if not candidates:
             return {"discovery": {"indicators": []}, "merge_map": []}
+        # 如果只有一个候选指标，直接返回该指标作为唯一发现，并生成单组归并映射
         if len(candidates) == 1:
             candidate = next(iter(candidates.values()))
             groups = [
@@ -147,8 +170,14 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
                     "canonical_name": candidate["name"],
                     "aliases": candidate["aliases"],
                     "reason": "唯一候选，无需归并判断",
+                    "status": "confirmed",
+                    "evidence_refs": [
+                        {"candidate_id": candidate["indicator_id"], "evidence_index": 0}
+                    ],
+                    "context_evidence": [],
                 }
             ]
+        # 模型做首轮归并，模型输出confirmed、needs_context
         else:
             parts = [
                 {
@@ -159,12 +188,76 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
             groups = client.call(
                 "merge_indicators", prompts.MERGE, parts, MergePlan
             ).model_dump()["groups"]
-        assigned = [cid for group in groups for cid in group["candidate_ids"]]
-        if len(assigned) != len(set(assigned)) or set(assigned) != set(candidates):
-            raise ValueError(
-                "归并结果必须恰好覆盖每个候选一次，不得遗漏、重复或新增候选"
-            )
+        # 验证首轮归并结果
+        validate_merge_plan(groups, candidates)
+
+        # 对 needs_context 的组进行二次复核
+        final_groups = []
+        chunks_by_id = {c["chunk_id"]: c for c in state["chunks"]}
+        for group_index, group in enumerate(groups):
+            if group["status"] != "needs_context":
+                final_groups.append({**group, "review": None})
+                continue
+            # 待复核组复核
+            subset = {cid: candidates[cid] for cid in group["candidate_ids"]}
+            chunk_ids = unique([c["chunk_id"] for c in subset.values()])
+            # 为每个待复核组生成输入正文，包含候选指标和初步归并决定
+            parts = [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "candidates": list(subset.values()),
+                            "initial_decision": group,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ]
+            supplied = {}
+            # 为每个待复核组补充来源章节的全文和科学图片
+            for chunk_id in chunk_ids:
+                chunk = chunks_by_id[chunk_id]
+                chunk_parts = content(state, chunk)
+                supplied[chunk_id] = chunk_parts
+                parts.append(
+                    {
+                        "type": "text",
+                        "text": f"以下是来源章节 {chunk_id}：{chunk['title']}",
+                    }
+                )
+                parts.extend(chunk_parts)
+            stage = f"merge_review_{group_index + 1:03d}"
+            # 调用模型做复核
+            reviewed = client.call(
+                stage, prompts.MERGE_REVIEW, parts, MergePlan
+            ).model_dump()["groups"]
+            # 验证复核结果
+            validate_merge_plan(reviewed, subset, review=True)
+            # 验证复核引用的补充证据确实来自提供过的真实原文，验证通过后再把复核结果和复核记录一起存入最终归并结果。
+            for resolved in reviewed:
+                for item in resolved["context_evidence"]:
+                    chunk_id = item["chunk_id"]
+                    if chunk_id not in supplied:
+                        raise ValueError(f"{stage} 引用了未提供的章节 {chunk_id}")
+                    validate(
+                        item, state, supplied[chunk_id], stage, chunks_by_id[chunk_id]
+                    )
+                final_groups.append(
+                    {
+                        **resolved,
+                        "review": {
+                            "initial_decision": group,
+                            "supplied_chunk_ids": chunk_ids,
+                        },
+                    }
+                )
+        groups = final_groups
+
+
+        # 按候选 ID 排序，保证归并结果在不同运行中顺序一致，便于对比。
         groups.sort(key=lambda g: min(g["candidate_ids"]))
+        # 遍历每个合并后的指标，生成最终指标清单和归并映射
         indicators, mapping = [], []
         for index, group in enumerate(groups, 1):
             members = [candidates[cid] for cid in group["candidate_ids"]]
@@ -266,8 +359,12 @@ def build_graph(settings: Settings, client, *, checkpointer=None, interrupt_afte
         if previous != "discover_chunks":
             graph.add_edge(previous, name)
         previous = name
-    graph.add_conditional_edges("discover_chunks", after_discover,
-                                ["discover_chunks", "merge_indicators"])
+    graph.add_conditional_edges(
+        "discover_chunks", after_discover, ["discover_chunks", "merge_indicators"]
+    )
     graph.add_edge(previous, END)
-    return graph.compile(checkpointer=checkpointer, interrupt_after=interrupt_after,
-                         interrupt_before=interrupt_before)
+    return graph.compile(
+        checkpointer=checkpointer,
+        interrupt_after=interrupt_after,
+        interrupt_before=interrupt_before,
+    )

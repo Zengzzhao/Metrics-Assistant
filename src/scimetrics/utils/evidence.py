@@ -4,32 +4,50 @@ import difflib
 import json
 import re
 
-_MATH = re.compile(r"\$\$.*?\$\$|(?<!\\)\$(?!\$)(?:\\.|[^$])*?(?<!\\)\$|\\\(.*?\\\)|\\\[.*?\\\]", re.S)
+_TYPOGRAPHY = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'", "‐": "-", "‑": "-",
+                            "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl"})
+_LAYOUT_BOUNDARIES = set("/-$\\{}_ ^()[]".replace(" ", ""))
 
 
-def normalize(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
+def normalized_map(raw: str):
+    """有限排版规范化，并保留每个规范字符对应的原始起止位置。"""
+    chars, spans = [], []
+    for index, char in enumerate(raw):
+        for replacement in char.translate(_TYPOGRAPHY):
+            if replacement.isspace():
+                if chars and chars[-1] == " ":
+                    spans[-1] = (spans[-1][0], index + 1)
+                else:
+                    chars.append(" ")
+                    spans.append((index, index + 1))
+            else:
+                chars.append(replacement)
+                spans.append((index, index + 1))
+    kept = []
+    for i, char in enumerate(chars):
+        if char == " " and (i == 0 or i == len(chars) - 1
+                or chars[i - 1] in _LAYOUT_BOUNDARIES or chars[i + 1] in _LAYOUT_BOUNDARIES):
+            continue
+        kept.append(i)
+    return "".join(chars[i] for i in kept), [spans[i] for i in kept]
 
 
-def normalize_math(value: str) -> str:
-    # 仅忽略 LaTeX 命令与左花括号间空白，不改词间空格或数学符号。
-    return re.sub(r"(\\[A-Za-z]+)\s+(?=\{)", r"\1", value)
-
-
-def quote_matches(quote: str, raw: str) -> bool:
-    query = normalize(quote)
+def locate_quote(quote: str, raw: str):
+    """返回匹配方式和所有原文位置；不以相似度决定通过。"""
+    if not isinstance(quote, str) or not quote.strip():
+        return None
+    exact = [(m.start(), m.end()) for m in re.finditer(re.escape(quote), raw)]
+    if exact:
+        return "exact", exact
+    query, _ = normalized_map(quote)
+    source, offsets = normalized_map(raw)
     if not query:
-        return False
-    # 优先原文匹配，避免规范化反而破坏本来完全一致的引句。
-    if query in normalize(raw):
-        return True
-    # 两侧都包含数学定界符的混合正文引句。
-    source = normalize(_MATH.sub(lambda m: normalize_math(m.group()), raw))
-    if normalize(_MATH.sub(lambda m: normalize_math(m.group()), quote)) in source:
-        return True
-    # 模型可能仅引用公式内部，不带 $/$$；仅在原文数学区域内比较。
-    math_query = normalize(normalize_math(quote))
-    return any(math_query in normalize(normalize_math(m.group())) for m in _MATH.finditer(raw))
+        return None
+    spans = [(offsets[m.start()][0], offsets[m.end() - 1][1])
+             for m in re.finditer(re.escape(query), source)]
+    # 禁止在展开的 Unicode 字形中间截断匹配。
+    spans = [span for span in spans if normalized_map(raw[span[0]:span[1]])[0] == query]
+    return ("normalized", spans) if spans else None
 
 
 def whitespace_map(raw: str):
@@ -95,13 +113,25 @@ def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', sour
     def visit(value, path='$', owner=None):
         if isinstance(value, dict):
             identity = {k: value[k] for k in ('indicator_id', 'name', 'subject_id', 'predicate', 'object_id') if k in value}
-            owner = identity or owner
+            owner = {**identity, **{k: value[k] for k in ('definition', 'assertion_mode', 'rationale_summary', 'scope') if k in value}} if identity else owner
             if value.get('kind') in {'text', 'visual'} and 'quote' in value:
                 quote = value['quote']
                 reason = None
                 if value['kind'] == 'text':
-                    if not isinstance(quote, str) or not quote_matches(quote, raw_content):
+                    match = locate_quote(quote, raw_content)
+                    if match is None:
                         reason = 'text_quote_not_found'
+                    else:
+                        method, spans = match
+                        # 同一引句重复出现时保留所有位置，不臆断唯一来源。
+                        start, end = spans[0]
+                        value.update(quote=raw_content[start:end], extracted_quote=quote,
+                                     match_method=method, source_file=source_path,
+                                     source_spans=[{'start': source_start + a, 'end': source_start + b,
+                                                    'quote': raw_content[a:b]}
+                                                   for a, b in spans])
+                        if len(spans) == 1:
+                            value.update(source_start=source_start + start, source_end=source_start + end)
                 elif quote not in visual_urls:
                     reason = 'visual_url_not_supplied'
                 elif not (value.get('observation') or '').strip():
@@ -111,13 +141,13 @@ def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', sour
                              'kind': value['kind'], 'quote': quote}
                     if value['kind'] == 'text' and isinstance(quote, str):
                         error['nearest_source'] = nearest_excerpt(quote, raw_content, source_start, full_raw)
-                        if full_raw is not None and quote_matches(quote, full_raw):
+                        if full_raw is not None and locate_quote(quote, full_raw):
                             error['found_elsewhere_in_full_document'] = True
                     else:
                         error['supplied_image_urls'] = sorted(visual_urls)
                         error['observation'] = value.get('observation')
                     errors.append(error)
-            for key, child in value.items():
+            for key, child in list(value.items()):
                 visit(child, f'{path}.{key}', owner)
         elif isinstance(value, list):
             for index, child in enumerate(value):

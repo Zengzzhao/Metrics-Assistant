@@ -35,6 +35,7 @@ src/scimetrics/
     ├── __init__.py
     ├── document.py     # Markdown 解析、章节划分、多模态消息与文件工具
     ├── evidence.py     # 证据定位、校验及错误诊断
+    ├── merge.py        # 归并覆盖、名称及证据引用校验
     ├── client.py       # DeepSeek 请求与响应解析
     └── observability.py # LangSmith 追踪
 ```
@@ -56,7 +57,7 @@ flowchart LR
 2. **classify_images**：逐张仅发送 image_url，系统提示词说明科学/非科学二分类任务。不发送正文、图注或 alt。
 3. **plan_chunks**：Markdown 一级、二级标题均作为独立章节边界（不猜测被 MinerU 扁平化的子标题层级）。过滤 References、Bibliography、Funding、Acknowledgements、Author contributions、Conflict of interest 及常见拼写变体；其他章节默认保留，包含 Abstract、Appendix。只有标题没有正文的章节过滤，只有科学图片的章节保留。记录跳过原因。正文和位置不改写。
 4. **discover_chunks**：每个保留章节单独调用模型。正文和科学图片按原文顺序发送，非科学图片语法跳过。程序分配全局唯一候选 ID，如 C0002_I001。章节超过配置上限时报错，不自行截断或再拆分。每次节点执行只处理一章，成功后将结果追加到 State 的 chunk_discoveries；检查点模式在下一章开始前同步保存。失败时重试当前章节，已完成章节不重复调用。
-5. **merge_indicators**：模型根据候选名称、定义与原始证据输出归并分组；程序要求每个候选恰好属于一组，不确定则分开。按组分配 I001 等统一 ID，程序合并别名、定义、评价对象、证据及来源章节，保留 merge_map。不让模型重新生成证据。零候选或单候选不发起归并模型调用。
+5. **merge_indicators**：模型根据候选名称、定义与原始证据输出归并分组；程序要求每个候选恰好属于一组，不确定则分开。按组分配 I001 等统一 ID，程序合并别名、定义、评价对象、证据及来源章节，保留 merge_map。不让模型改写已有证据。有歧义时补充来源章节和图片复核一次，新增复核证据单独保存并校验。零候选或单候选不发起归并模型调用。
 6. **extract_pi_relation**：原始全文（包括参考文献）＋科学图片＋固定指标清单，独立抽取 PROPOSES/MODIFIES/APPLIES。参考文献仅辅助归因，不把他人成果归给本文。无指标时返回空列表。
 7. **extract_ii_relation**：相同全文多模态输入＋指标清单，独立抽取 VARIANT_OF/DERIVED_FROM/IMPROVES_ON/ALTERNATIVE_TO/COMPONENT_OF；不足两个指标时返回空列表。完成后写 result.json。
 
@@ -152,10 +153,29 @@ LangGraph 支持读取 `graph.get_state_history(config)`，选择历史快照后
 
 ### 证据校验失败诊断
 
-`check_evidence` 会一次列出所有失败证据，打印节点、输入文件、chunk 标题和字符范围、JSON 字段路径（数组下标从 0 开始）、所属指标/关系、完整 quote。文字证据还提供近似原文、Markdown 行号、全局字符范围及差异片段；近似匹配仅供诊断，绝不据此接受证据。视觉错误列出本次实际发送的图片 URL。
+`check_evidence` 会一次列出所有失败证据，打印节点、输入文件、chunk 标题和字符范围、JSON 字段路径（数组下标从 0 开始）、所属指标/关系、完整 quote。文字证据还提供近似原文、Markdown 行号、全局字符范围及差异片段；近似匹配仅用于诊断，不作为通过依据。视觉错误列出本次实际发送的图片 URL。
 
 失败详情和完整抽取响应保存到每篇输出目录的 `evidence_errors/<stage>.json`，方便不重调 API 就检查失败内容。重复失败会覆盖该阶段的旧报告；已存在的报告是历史诊断，不表示本轮仍失败。
 
-文字匹配忽略连续空白差异；仅在 `$...$`、`$$...$$`、`\(...\)`、`\[...\]` 数学片段内，进一步忽略 LaTeX 命令与左花括号间的空白，例如 `\operatorname {cit}` 与 `\operatorname{cit}`。不做公式等价推断，也不忽略标点、符号或数值差异。
+### 分层来源匹配
 
-公式证据先进行仅折叠空白的原文匹配，避免规范化破坏已有匹配；对于不带数学定界符的公式引句，额外在原文数学片段内使用相同的 LaTeX 空白规范化规则比较。原始引句和原文不改写，近似匹配仍只用于诊断。
+文字证据只使用程序校验，不调用模型修复：
+1. exact：原始引句逐字存在于当前范围。
+2. normalized：统一连续空白、弯引号、Unicode 排版连字符和常见连字，并忽略斜杠、连字符、数学定界符及括号等连接边界的空白。保留普通单词间空格、大小写、数值、小数点和数学符号；不做公式等价变换。
+3. 两层均失败时，保存诊断并报错。近似位置仅供诊断，不作为通过依据；不对拼写或大小写变化自动放行。
+
+发现提示词要求逐字摘录，保留原文大小写、OCR 拼写和 LaTeX 写法；优先简短但足以支持判断的连续片段。提示词不能保证模型始终遵循，程序仍负责来源校验。视觉证据继续验证实际发送的 URL 和 observation。
+
+校验成功后 quote 保存真实原文，extracted_quote 保留模型原引句，match_method 仅为 exact/normalized，source_file 和 source_spans 记录来源。字符位置使用原 Markdown 的 Python 字符偏移，左闭右开。重复出现时保留所有位置及对应原句；唯一位置时额外填写 source_start/source_end。元数据由程序生成，不要求抽取模型填写。
+
+失败后按现有 checkpoint 粒度恢复，重新执行失败章节；未实现失败响应跨进程复用。已经提交的章节不会自动重新抽取或补写溯源字段。
+
+### 具名指标发现与证据驱动归并
+
+发现提示词只允许本章正文或科学图片中有明确名称、缩写或已定义指标符号的候选。不把 “the indicator”“normalized indicator” 等孤立泛称建成指标；本章有明确指代依据时使用具体名称并引用相应证据。该限制通过提示词实施，现有来源校验不等同于自动证明名称具体性。
+
+归并首轮仍只发送候选记录和原证据。每组 status 为 confirmed 或 needs_context，reason 解释判断，evidence_refs 用 candidate_id 和从 0 开始的 evidence_index 引用依据，并覆盖组内所有候选。规范名和别名限于本组候选已有名称/别名，程序校验引用和覆盖完整性。
+
+needs_context 是待复核集合，不直接作为合并结果。每个集合追加一次模型复核，输入包含所有成员的来源章节原文及科学图片（真实 image_url）；不会默认发送全文，也不检索未关联章节。复核结果必须附 context_evidence（chunk_id 和 evidence），程序在对应章节及实际发送图片中验证。复核后所有组均为 confirmed；仍缺少合并依据时，候选逐个单独成组，并在 reason 说明原因，不强行合并。confirmed 表示最终分组已确定，不等同于证明各组互不相同。来源章节总输入超限会报错，不裁剪。归并 reason 的语义正确性仍需人工评估，程序只能检查来源和结构。
+
+merge_map 保存最终状态、归并依据引用、补充证据，以及复核时的 initial_decision 和 supplied_chunk_ids。已有候选证据不改写。一次 merge 节点仍在全部复核成功后提交；中途失败恢复会重做该节点。已保存的 discover 结果不会因提示词更新自动重新抽取，如需应用具名限制，应使用新 thread_id 从头运行。
