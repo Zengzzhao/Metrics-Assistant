@@ -103,7 +103,7 @@ def build_graph(
             **bounds,
         )
 
-    def validate(data, state, parts, stage, chunk=None):
+    def validate(data, state, parts, stage, chunk=None, source_ranges=None):
         raw = state["raw_content"]
         scope = raw[chunk["start"] : chunk["end"]] if chunk else raw
         try:
@@ -115,6 +115,7 @@ def build_graph(
                 source_path=str(settings.input_path.resolve()),
                 chunk=chunk,
                 full_raw=raw,
+                source_ranges=source_ranges,
             )
         except EvidenceValidationError as error:
             # 仅失败时保存完整响应和诊断；无请求正文、Base64 或密钥。
@@ -290,8 +291,13 @@ def build_graph(
             mapping.append({"indicator_id": iid, **group})
         return {"discovery": {"indicators": indicators}, "merge_map": mapping}
 
-    def relation_parts(state):
-        parts = content(state)
+    def relation_parts(state, *, retained_only=False):
+        if retained_only:
+            parts = []
+            for chunk in state["chunks"]:
+                parts.extend(content(state, chunk))
+        else:
+            parts = content(state)
         parts.append(
             {
                 "type": "text",
@@ -299,20 +305,41 @@ def build_graph(
                 + json.dumps(state["discovery"], ensure_ascii=False),
             }
         )
+        if retained_only and (
+            sum(len(p["text"]) for p in parts if p["type"] == "text") > settings.max_chars
+            or sum(p["type"] == "image_url" for p in parts) > settings.max_images
+            or len(json.dumps(parts).encode()) > settings.max_body_bytes
+        ):
+            raise ValueError("PI 保留章节与指标清单的总输入超过资源限额；不会截断")
         return parts
 
     def pi_relation(state):
         if not state["discovery"]["indicators"]:
             return {"paper_relations": []}
-        parts = relation_parts(state)
+        parts = relation_parts(state, retained_only=True)
         relations = client.call(
             "extract_pi_relation", prompts.EXTRACT_PI, parts, PaperRelations
         ).model_dump()["paper_relations"]
         known = {i["indicator_id"] for i in state["discovery"]["indicators"]}
-        if any(r["indicator_id"] not in known for r in relations):
-            raise ValueError("论文关系引用未知指标 ID")
-        validate(relations, state, parts, "extract_pi_relation")
-        return {"paper_relations": unique(relations)}
+        for index, relation in enumerate(relations):
+            if relation["indicator_id"] not in known:
+                raise ValueError(
+                    f"paper_relations[{index}].indicator_id={relation['indicator_id']!r} "
+                    f"不属于 merge 后的统一指标清单：{sorted(known)}"
+                )
+        assigned = [r["indicator_id"] for r in relations]
+        if len(assigned) != len(set(assigned)):
+            raise ValueError("PI 每个指标只能返回一条判定，不允许多关系或重复的无关系记录")
+        missing = known - set(assigned)
+        if missing:
+            raise ValueError(f"PI 未覆盖全部指标，缺少：{sorted(missing)}；无关系也必须记录原因")
+        order = {i["indicator_id"]: n for n, i in enumerate(state["discovery"]["indicators"])}
+        relations.sort(key=lambda r: order[r["indicator_id"]])
+        validate(
+            relations, state, parts, "extract_pi_relation",
+            source_ranges=[(c["start"], c["end"]) for c in state["chunks"]],
+        )
+        return {"paper_relations": relations}
 
     def ii_relation(state):
         relations = []

@@ -188,16 +188,78 @@ context_evidence 填写规则：
 evidence.kind、evidence.quote、evidence.observation 按以下证据规则填写。
 """ + EVIDENCE_RULES
 
-EXTRACT_PI = COMMON + EVIDENCE_RULES + """
-结合全文、科学图片和固定指标清单，抽取当前论文与指标之间的关系。
-仅使用清单内 indicator_id，不修改指标清单。关系逐条输出，允许同一指标有多个标签。
-PROPOSES：本文明确提出、命名或正式定义新指标；作者自述用 origin_status=author_claimed，
-转述来源只能算 citation_supported，不能把参考文献作者的贡献归给本文。
-MODIFIES：本文对既有指标进行修正、扩展、加权、归一化或对象/窗口调整。
-APPLIES：本文实际用于实证、案例、评价或方法比较。
-强制归类，不能是无关系的空数组。每条关系分别提供证据。
-explicit 为文献明示；inferred 必须给依据摘要 rationale_summary、assumptions 及 scope。
-"""
+EXTRACT_PI = COMMON + """
+【总纲】
+本次输入为当前论文经过章节过滤后保留的正文、实际发送的科学图片，以及 merge 节点输出的固定指标清单 indicators。
+请逐一检查清单中的指标，抽取当前论文与指标之间的 PROPOSES、MODIFIES、APPLIES 关系，输出 paper_relations。
+不重新发现指标，不改变归并结果，不新增、删除或重新编号指标。每个指标必须恰好输出一条判定，有关系选一个主关系，无关系也记录原因。
+
+输入结构与字段说明：
+仅使用 plan_chunks 保留的 chunks；不读取 skipped_sections，不假设已获得整篇论文。
+引用必须来自本次提供的某个章节，单条 quote 不得跨章节拼接。
+本次模型消息先提供按原文顺序排列的保留章节与其中的科学图片，再提供从 state.discovery 取出的 JSON 对象。
+其顶层只有 indicators 数组，不是整个 State、chunk_discoveries 或 merge_map。
+indicators 中每项字段如下：
+1. indicator_id：归并后的统一 ID（如 I001），用于输出关系的端点。
+2. name：归并后的指标名称。
+3. aliases：归并后的别名列表，用于识别同一指标在本次提供的章节中的不同表述。
+4. definitions：来源定义的列表，可能为空；不是章节候选中的单个 definition。
+   不把多个片段拼接成一条原文，不因某定义出现就断定本文首次提出。
+5. evidence：已有指标证据的列表。已有证据仅辅助识别和定位，不能自动证明论文提出、修改或应用了指标。
+6. source_chunk_ids：指标来源章节 ID 列表，只用于追溯，不是关系端点。
+7. candidate_ids：归并前的章节候选 ID 列表（如 C0007_I001），只用于追溯，不能替代统一 indicator_id。
+
+关系判断规则：
+1. 判断主体始终是当前论文，区分本文作者行为与介绍、引用其他论文的行为。
+2. PROPOSES：本文首次提出、命名或正式定义的新指标；仅复述已有定义或引用源头文献不算本文提出。
+3. MODIFIES：本文实际对已有指标进行修正、扩展、加权、归一化、窗口或适用对象调整。
+   引用别人提出的变体不算本文修改；在清单已有相应变体时，优先将关系指向本文形成的变体。
+4. APPLIES：本文将某个已有指标实际用于实证、案例、评价或方法比较；仅在背景中提及不算应用。
+5. 指标变体和原指标保持归并后的独立 ID。主关系按有证据支持的 PROPOSES > MODIFIES > APPLIES 选择。
+   本文提出新指标并进行应用实验时，只输出 PROPOSES；修改并应用但没有提出依据时，只输出 MODIFIES。
+   优先级不替代证据，不得为了优先选择 PROPOSES 而推测首次提出。
+6. References、Funding 等被过滤章节不在输入中。保留章节中的引文也不能把被引作者贡献归于本文。
+7. 允许有证据的推断，但必须显式标记；三种关系都不成立或证据不足时，predicate=null，填写无关系原因，不漏掉指标。
+
+【字段填写规则】
+paper_relations 填写规则：
+严格覆盖固定指标清单，每个 indicator_id 恰好出现一次，不遗漏、不重复、不新增。
+每项为一个主关系或无关系判定；只有输入指标清单为空才返回 []。
+无关系记录不是知识图谱中的关系边，不能将 null 当作关系类型。
+
+indicator_id 填写规则：
+原样使用固定清单中的统一 indicator_id。不填 candidate_ids、source_chunk_ids、指标名称或新 ID。
+
+predicate 填写规则：
+按优先级填写 PROPOSES、MODIFIES、APPLIES 之一；没有可支持的关系填写 null，不输出标签数组。
+
+assertion_mode 填写规则：
+explicit 表示原文明确表达该关系；inferred 表示结合多条事实推断，并非作者明确陈述。
+不能仅因名称相似、模型常识或已有归并结果推断关系。predicate=null 时 assertion_mode 必须为 null。
+
+evidence 填写规则：
+有关系时至少一条，直接支持所选主关系或构成推断前提，而不只是名称出现证据。
+无关系原因为“仅背景提及”或“未实际应用”时，至少一条相关原文，支持背景介绍、建议应用或不适用的判断。
+原因为“证据不足”时允许 []；有相关片段但无法判断时可列出片段，不编造“不存在”的证据。
+可复用已有 quote，但必须重新核对其本次提供的章节语境。只输出 kind、quote、observation，不能输出 evidence_refs。
+文字 quote 直接复制原文连续片段；视觉 quote 为实际输入图片 URL。具体遵循下方证据规则。
+
+rationale_summary 填写规则：
+inferred 时必须用中文明确写出“这是推断”，并按本条 evidence 的数组下标（从 0 开始）
+说明用了哪些证据、这些事实如何支持该关系，给出简短依据，不输出思维过程。
+explicit 时可为 null，必要时简短说明归因和指代。无关系时返回 null，说明放在 no_relation_detail。
+
+no_relation_reason 填写规则：
+有关系时返回 null；无关系时选择以下一个原因：
+1. 仅背景提及：仅介绍、列举或讨论已有指标，没有本文提出、修改或实际应用的依据。
+2. 未实际应用：仅建议、设想、作为可选方案或明确未采用，且无本文提出或修改的依据。
+3. 证据不足：指标身份、作者归属或使用方式不清，无法确定三种关系中的任何一种。
+
+no_relation_detail 填写规则：
+有关系时返回 null；无关系时必须用中文说明针对该指标的具体原因，不能仅重复原因分类。
+结合已有片段说明不能建立关系的原因；没有实际应用证据不等于已证明未应用。
+判断限于本次提供的章节，不声称已排查被过滤内容或外部文献。
+""" + EVIDENCE_RULES
 
 EXTRACT_II = COMMON + EVIDENCE_RULES + """
 结合全文、科学图片和固定指标清单，抽取指标间关系，仅使用清单内 indicator_id，不修改指标清单。

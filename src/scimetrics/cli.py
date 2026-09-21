@@ -31,7 +31,7 @@ class RunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     input: Path
     output: Path = Path(".debug")
-    action: Literal["run", "start", "resume", "inspect", "continue"] = "run"
+    action: Literal["run", "start", "resume", "inspect", "continue", "replay"] = "run"
     pattern: str = "*.md"
     model: str = "deepseek-flash"
     max_output_tokens: int = Field(default=65536, gt=0, strict=True)
@@ -41,6 +41,7 @@ class RunConfig(BaseModel):
     timeout: float = Field(default=600, gt=0)
     db: Path = Path(".debug/checkpoints.sqlite")
     thread_id: str = Field(default="paper-001", pattern=r"\S")
+    replay_node: NodeName = "extract_pi_relation"
     stop_after: list[NodeName] = Field(
         default_factory=lambda: [
             "prepare_document",
@@ -86,7 +87,7 @@ def load_config(path: Path, action=None):
     return config
 
 # 执行编排流程
-def execute(graph, initial, name, thread_id=None):
+def execute(graph, initial, name, thread_id=None, checkpoint_config=None):
     config = {
         "run_id": uuid4(),
         "run_name": name,
@@ -96,6 +97,8 @@ def execute(graph, initial, name, thread_id=None):
     }
     if thread_id:
         config["configurable"] = {"thread_id": thread_id}
+    if checkpoint_config is not None:
+        config["configurable"] = checkpoint_config["configurable"]
     for update in graph.stream(initial, config=config, stream_mode="updates", durability="sync"):
         for node in update:
             if node != "__interrupt__":
@@ -167,7 +170,7 @@ def run_checkpoint(args):
                     "output_dir": Path(values["output_dir"]),
                 }
             )
-            if args.action == "resume":
+            if args.action in {"resume", "replay"}:
                 if (
                     not settings.input_path.is_file()
                     or digest(settings.input_path.read_bytes()) != saved["input_hash"]
@@ -177,7 +180,7 @@ def run_checkpoint(args):
                     )
         # 输入、输出和模型固定；恢复时允许用当前配置调整资源限额。
         client_options = dict(saved["client"])
-        if args.action == "resume":
+        if args.action in {"resume", "replay"}:
             settings.max_chars = args.max_chars
             settings.max_images = args.max_images
             settings.max_body_bytes = args.max_body_bytes
@@ -195,7 +198,16 @@ def run_checkpoint(args):
         config = {"configurable": {"thread_id": args.thread_id}}
         if args.action != "inspect":
             validate_tracing()
-            before = graph.get_state(config)
+            replay_config = None
+            if args.action == "replay":
+                previous = next((snapshot for snapshot in graph.get_state_history(config)
+                                 if args.replay_node in snapshot.next), None)
+                if previous is None:
+                    raise ValueError(f"历史中没有等待执行 {args.replay_node} 的检查点")
+                replay_config = previous.config
+                print(f"[REPLAY] {args.replay_node} 从检查点 "
+                      f"{replay_config['configurable']['checkpoint_id']} 重跑，保留原历史。", flush=True)
+            before = graph.get_state(replay_config or config)
             if args.action == "resume" and before.values and not before.next:
                 print("[COMPLETE] 该任务已完成，没有后续节点。")
                 return before
@@ -206,6 +218,7 @@ def run_checkpoint(args):
                 {} if args.action == "start" else None,
                 f"debug:{args.thread_id}",
                 args.thread_id,
+                checkpoint_config=replay_config,
             )
         snapshot = graph.get_state(config)
         report = {
@@ -281,7 +294,7 @@ def main():
     )
     parser.add_argument("--config", type=Path, default=Path("run.toml"))
     parser.add_argument(
-        "--action", choices=["run", "start", "resume", "inspect", "continue"]
+        "--action", choices=["run", "start", "resume", "inspect", "continue", "replay"]
     )
     options = parser.parse_args()
     # 无论从哪个工作目录调用，都读取配置文件旁的 .env；已有环境变量优先。

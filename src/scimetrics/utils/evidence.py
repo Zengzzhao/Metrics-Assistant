@@ -105,7 +105,7 @@ class EvidenceValidationError(ValueError):
 
 
 def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', source_path=None,
-                   chunk=None, full_raw=None):
+                   chunk=None, full_raw=None, source_ranges=None):
     visual_urls = {p['image_url']['url'] for p in parts if p['type'] == 'image_url'}
     errors = []
     source_start = chunk['start'] if chunk else 0
@@ -118,7 +118,18 @@ def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', sour
                 quote = value['quote']
                 reason = None
                 if value['kind'] == 'text':
-                    match = locate_quote(quote, raw_content)
+                    if source_ranges is None:
+                        match = locate_quote(quote, raw_content)
+                    else:
+                        # 各章节独立匹配，禁止引用已过滤章节或拼接跨章节引句。
+                        matches = []
+                        for left, right in source_ranges:
+                            located = locate_quote(quote, raw_content[left:right])
+                            if located:
+                                method, spans = located
+                                matches.extend((method, left + a, left + b) for a, b in spans)
+                        method = "exact" if any(m[0] == "exact" for m in matches) else "normalized"
+                        match = (method, [(a, b) for kind, a, b in matches if kind == method]) if matches else None
                     if match is None:
                         reason = 'text_quote_not_found'
                     else:
@@ -156,5 +167,5 @@ def check_evidence(data, raw_content: str, parts: list, *, stage='unknown', sour
     visit(data)
     if errors:
         raise EvidenceValidationError({'stage': stage, 'source_file': source_path,
-            'chunk': chunk, 'source_range': {'start': source_start, 'end': source_start + len(raw_content)},
+            'chunk': chunk, 'allowed_source_ranges': source_ranges, 'source_range': {'start': source_start, 'end': source_start + len(raw_content)},
             'error_count': len(errors), 'errors': errors})

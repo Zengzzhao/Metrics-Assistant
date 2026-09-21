@@ -91,12 +91,12 @@ class MergePlan(StrictModel):
 
 
 class Grounded(StrictModel):
+    # 断言模式：explicit 表示原文明确表达该关系；inferred 表示结合多条事实推断，并非作者明确陈述。
     assertion_mode: Literal["explicit", "inferred"]
+    # 证据
     evidence: list[Evidence] = Field(min_length=1)
+    # 推断的摘要。inferred必须有简短依据摘要，explicit时可为null
     rationale_summary: str | None = None
-    assumptions: list[str] = Field(default_factory=list)
-    scope: str | None = None
-
     @model_validator(mode="after")
     def require_rationale(self):
         if self.assertion_mode == "inferred" and not (
@@ -106,15 +106,39 @@ class Grounded(StrictModel):
         return self
 
 
-class PaperRelation(Grounded):
-    indicator_id: str
-    predicate: Literal["PROPOSES", "MODIFIES", "APPLIES"]
-    origin_status: (
-        Literal["author_claimed", "citation_supported", "unresolved"] | None
-    ) = None
+class PaperRelation(StrictModel):
+    indicator_id: str = Field(min_length=1, description="merge 后固定指标清单中的统一 ID")
+    predicate: Literal["PROPOSES", "MODIFIES", "APPLIES"] | None
+    assertion_mode: Literal["explicit", "inferred"] | None
+    evidence: list[Evidence]
+    rationale_summary: str | None = None
+    no_relation_reason: Literal["仅背景提及", "未实际应用", "证据不足"] | None
+    no_relation_detail: str | None
+
+    @model_validator(mode="after")
+    def validate_decision(self):
+        if self.predicate is None:
+            if self.assertion_mode is not None:
+                raise ValueError("无关系判定的 assertion_mode 必须为 null")
+            if self.no_relation_reason is None or not (self.no_relation_detail and self.no_relation_detail.strip()):
+                raise ValueError("无关系判定必须填写原因分类和具体说明")
+            if self.no_relation_reason != "证据不足" and not self.evidence:
+                raise ValueError("仅背景提及/未实际应用必须提供相关原文证据")
+        else:
+            if self.no_relation_reason is not None or self.no_relation_detail is not None:
+                raise ValueError("有关系时无关系原因字段必须为 null")
+            if self.assertion_mode is None or not self.evidence:
+                raise ValueError("有关系必须提供 assertion_mode 和证据")
+            if self.assertion_mode == "inferred" and not (self.rationale_summary and self.rationale_summary.strip()):
+                raise ValueError("推断必须有简短依据摘要")
+        return self
 
 
 class IndicatorRelation(Grounded):
+    # 列出推断依赖但原文未直接陈述的假设，使用中文；没有额外假设返回 []。假设不能替代缺失证据，不得用“假定本文首次提出”来建立 PROPOSES。
+    assumptions: list[str] = Field(default_factory=list)
+    # 关系适用的对象、变体、实验或评价场景；无需要限定的条件时返回 null，不凭空补充。
+    scope: str | None = None
     subject_id: str
     predicate: Literal[
         "VARIANT_OF", "DERIVED_FROM", "IMPROVES_ON", "ALTERNATIVE_TO", "COMPONENT_OF"

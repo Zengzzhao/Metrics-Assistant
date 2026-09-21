@@ -2,9 +2,9 @@
 UV ?= uv
 CONFIG ?= run.toml
 
-.PHONY: help install run start inspect resume continue
+.PHONY: help install run start inspect resume continue replay
 help:
-	@echo '先修改 run.toml 与 .env，再使用 make run/start/inspect/resume/continue'
+	@echo '先修改 run.toml 与 .env，再使用 make run/start/inspect/resume/continue/replay'
 install:
 	$(UV) sync
 # make start     # 启动并在指定节点暂停
@@ -12,5 +12,5 @@ install:
 # make resume    # 继续到下一个断点
 # make continue # 执行剩余全部节点
 # make run       # 完整运行
-run start inspect resume continue:
+run start inspect resume continue replay:
 	$(UV) run scimetrics --config "$(CONFIG)" --action $@

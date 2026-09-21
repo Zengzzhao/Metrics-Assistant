@@ -58,7 +58,7 @@ flowchart LR
 3. **plan_chunks**：Markdown 一级、二级标题均作为独立章节边界（不猜测被 MinerU 扁平化的子标题层级）。过滤 References、Bibliography、Funding、Acknowledgements、Author contributions、Conflict of interest 及常见拼写变体；其他章节默认保留，包含 Abstract、Appendix。只有标题没有正文的章节过滤，只有科学图片的章节保留。记录跳过原因。正文和位置不改写。
 4. **discover_chunks**：每个保留章节单独调用模型。正文和科学图片按原文顺序发送，非科学图片语法跳过。程序分配全局唯一候选 ID，如 C0002_I001。章节超过配置上限时报错，不自行截断或再拆分。每次节点执行只处理一章，成功后将结果追加到 State 的 chunk_discoveries；检查点模式在下一章开始前同步保存。失败时重试当前章节，已完成章节不重复调用。
 5. **merge_indicators**：模型根据候选名称、定义与原始证据输出归并分组；程序要求每个候选恰好属于一组，不确定则分开。按组分配 I001 等统一 ID，程序合并别名、定义、评价对象、证据及来源章节，保留 merge_map。不让模型改写已有证据。有歧义时补充来源章节和图片复核一次，新增复核证据单独保存并校验。零候选或单候选不发起归并模型调用。
-6. **extract_pi_relation**：原始全文（包括参考文献）＋科学图片＋固定指标清单，独立抽取 PROPOSES/MODIFIES/APPLIES。参考文献仅辅助归因，不把他人成果归给本文。无指标时返回空列表。
+6. **extract_pi_relation**：保留章节＋其中科学图片＋固定指标清单，独立抽取 PROPOSES/MODIFIES/APPLIES。参考文献仅辅助归因，不把他人成果归给本文。无指标时返回空列表。
 7. **extract_ii_relation**：相同全文多模态输入＋指标清单，独立抽取 VARIANT_OF/DERIVED_FROM/IMPROVES_ON/ALTERNATIVE_TO/COMPONENT_OF；不足两个指标时返回空列表。完成后写 result.json。
 
 关系节点只使用已归并的指标 ID；不在两个关系调用中分别新增实体，避免 ID 不一致。当前流程按本次要求专注指标和两类关系，当前未实现公式/局限性抽取。
@@ -147,7 +147,7 @@ prepare_document 不调用模型，不需要 DeepSeek Key。inspect 不启用云
 
 make resume 遵循 stop_after 和 stop_before。当前配置保留准备、分类、划分及归并后的暂停点，移除 discover_chunks 后的暂停点，并在 merge_indicators 前暂停：从 plan_chunks 完成处恢复，将处理全部剩余章节后停在归并前，再次 resume 执行归并并在归并后暂停。若将 discover_chunks 加回 stop_after，则每章暂停。make continue 临时清空前后暂停点，运行到结束或报错，仍逐章保存。
 
-LangGraph 支持读取 `graph.get_state_history(config)`，选择历史快照后用 `graph.invoke(None, snapshot.config)` 从该快照继续执行。快照表示节点执行后的状态，因此要重新执行某节点，应选它执行前的快照（`next` 包含该节点）。这会重放后续节点并形成分支，不删除历史，不撤销模型调用费用或已写文件。目前 CLI 的 resume 只读取最新检查点，尚未提供选择历史 checkpoint_id 的入口。详见 [LangGraph time travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel)。
+LangGraph 支持读取 `graph.get_state_history(config)`，选择历史快照后用 `graph.invoke(None, snapshot.config)` 从该快照继续执行。快照表示节点执行后的状态，因此要重新执行某节点，应选它执行前的快照（`next` 包含该节点）。这会重放后续节点并形成分支，不删除历史，不撤销模型调用费用或已写文件。CLI 的 resume 读取最新检查点；replay 根据 replay_node 选择最近一个等待执行该节点的历史检查点。详见 [LangGraph time travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel)。
 
 项目不包含测试目录或 pytest 依赖。
 
@@ -179,3 +179,27 @@ LangGraph 支持读取 `graph.get_state_history(config)`，选择历史快照后
 needs_context 是待复核集合，不直接作为合并结果。每个集合追加一次模型复核，输入包含所有成员的来源章节原文及科学图片（真实 image_url）；不会默认发送全文，也不检索未关联章节。复核结果必须附 context_evidence（chunk_id 和 evidence），程序在对应章节及实际发送图片中验证。复核后所有组均为 confirmed；仍缺少合并依据时，候选逐个单独成组，并在 reason 说明原因，不强行合并。confirmed 表示最终分组已确定，不等同于证明各组互不相同。来源章节总输入超限会报错，不裁剪。归并 reason 的语义正确性仍需人工评估，程序只能检查来源和结构。
 
 merge_map 保存最终状态、归并依据引用、补充证据，以及复核时的 initial_decision 和 supplied_chunk_ids。已有候选证据不改写。一次 merge 节点仍在全部复核成功后提交；中途失败恢复会重做该节点。已保存的 discover 结果不会因提示词更新自动重新抽取，如需应用具名限制，应使用新 thread_id 从头运行。
+
+### 论文—指标关系输入契约
+
+extract_pi_relation 使用保留章节、其中科学图片及 merge 后的 discovery.indicators。指标字段为 indicator_id、name、aliases、definitions（列表）、evidence、source_chunk_ids、candidate_ids；关系端点只能用统一 indicator_id。发现证据和定义帮助识别指标，但不自动证明论文关系。证据溯源元数据由程序生成，本轮模型仍只输出 kind/quote/observation。
+
+EXTRACT_PI 按总纲与字段规则描述全部输出字段，每个指标恰好输出一条判定；有依据时按 PROPOSES > MODIFIES > APPLIES 选择主关系，否则 predicate=null 并记录无关系原因。PI 输出 indicator_id、predicate、assertion_mode、evidence、rationale_summary、no_relation_reason、no_relation_detail；必要条件和推断前提写入 rationale_summary，不单设 assumptions、scope、origin_status。PROPOSES 不表示已核实全球首创。推断须标记 inferred，rationale_summary 按本条 evidence 下标说明证据依据。来源验证使用保留章节范围内的精确/规范化匹配，自动附加位置，不调用模型修复。
+
+### PI 的章节输入范围
+
+extract_pi_relation 仅发送 plan_chunks 保留的 chunks，按原文顺序逐章构造正文与科学图片消息，再附加归并后的固定指标清单。skipped_sections 中的章节不作为正文输入；不改变原始 raw_content。合并后的总消息再次检查资源限额。
+
+PI 文字证据必须完整位于某个保留章节内，禁止引用过滤章节或跨章节拼接；字符位置仍映射到原 Markdown。图片证据只能引用本次发送的图片。extract_ii_relation 仍使用全文。近似位置诊断仍可能显示全文中的候选片段，但不作为允许范围内匹配成功的依据。
+
+### PI 全覆盖与单关系判定
+
+paper_relations 是逐指标判定列表，数量必须等于 discovery.indicators；未知、重复或缺少 ID 均报错，并按指标清单顺序保存。有关系时只保留优先级最高且有证据的 PROPOSES/MODIFIES/APPLIES，两个 no_relation 字段为 null。没有关系时 predicate、assertion_mode 为 null，no_relation_reason 为“仅背景提及”“未实际应用”或“证据不足”，no_relation_detail 说明具体原因。前两种原因需要相关证据，证据不足允许 evidence=[]。null 判定是审计记录，后续入图应跳过，不创建关系边。单关系优先级由模型根据证据判断，程序检查的是结构与完整覆盖。
+
+已完成 PI 的检查点不会自动改写为新结果；make resume 若 next 为 extract_ii_relation，不会重跑 PI。需重跑 PI 才会得到此格式，不从旧多标签记录自动推测无关系原因。
+
+### 从历史检查点重跑节点
+
+在 run.toml 设置 replay_node="extract_pi_relation"，执行 make replay。程序查找当前 thread_id 最近一个 next 包含该节点的历史检查点，从它重放，使用当前代码和资源限额；输入、输出、模型仍使用该任务保存的配置。缺少对应历史检查点时报错，不回退到从头执行。
+
+replay 遵循 stop_before/stop_after。当前 stop_after 包含 extract_pi_relation，因此重跑 PI 后暂停，再用 make inspect 查看结果。之后 make resume 从新分支最新检查点继续。每次 make replay 都重新选择历史起点，不把该起点应用到后续 resume。原历史不删除，但重放会重新调用模型；后续写入 result.json 时仍使用原输出路径，可能覆盖已有文件。
