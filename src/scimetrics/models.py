@@ -135,15 +135,11 @@ class PaperRelation(StrictModel):
 
 
 class IndicatorRelation(Grounded):
-    # 列出推断依赖但原文未直接陈述的假设，使用中文；没有额外假设返回 []。假设不能替代缺失证据，不得用“假定本文首次提出”来建立 PROPOSES。
-    assumptions: list[str] = Field(default_factory=list)
-    # 关系适用的对象、变体、实验或评价场景；无需要限定的条件时返回 null，不凭空补充。
-    scope: str | None = None
-    subject_id: str
+    subject_id: str = Field(min_length=1, description="归并后统一指标 ID，关系起点")
     predicate: Literal[
         "VARIANT_OF", "DERIVED_FROM", "IMPROVES_ON", "ALTERNATIVE_TO", "COMPONENT_OF"
     ]
-    object_id: str
+    object_id: str = Field(min_length=1, description="归并后统一指标 ID，关系终点")
 
 
 class PaperRelations(StrictModel):

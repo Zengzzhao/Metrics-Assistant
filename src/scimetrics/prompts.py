@@ -261,14 +261,59 @@ no_relation_detail 填写规则：
 判断限于本次提供的章节，不声称已排查被过滤内容或外部文献。
 """ + EVIDENCE_RULES
 
-EXTRACT_II = COMMON + EVIDENCE_RULES + """
-结合全文、科学图片和固定指标清单，抽取指标间关系，仅使用清单内 indicator_id，不修改指标清单。
-VARIANT_OF：A 是 B 的简单变体，保留核心结构、改变权重/参数/窗口/对象。
-DERIVED_FROM：A 明确直接衍生自 B，超出简单变体；同一方向不与 VARIANT_OF 重复。
-IMPROVES_ON：A 针对 B 的明确缺陷改进，注明维度、条件，区分设计意图与验证效果。
-ALTERNATIVE_TO：在明确评价场景可替代，共同被比较或高相关本身不足以证明可替代。
-COMPONENT_OF：A 作为子指标或输入指标构成 B，一般变量不是独立指标。
-所有方向按 A(subject_id) -> B(object_id)，无自关系；可多标签，但各自必须有证据。
-explicit 为原文明确表达；inferred 必须给依据摘要 rationale_summary、assumptions、scope。
-没有相依关系返回空数组。
-"""
+EXTRACT_II = COMMON + """
+【总纲】
+本次输入为 plan_chunks 保留的章节正文、其中实际发送的科学图片，以及 merge 后的固定指标清单。
+请抽取指标之间有证据支持的关系，输出 indicator_relations。不新增指标、不修改归并结果、不重新编号。
+本节点允许同一对指标有多个不同关系，但每种关系必须独立有据。
+不要求每个指标或每对指标都有关系；没有依据时不输出，不生成无关系记录。
+
+输入结构与字段说明：
+1. 消息先提供保留章节和科学图片，再提供 state.discovery 的 JSON：顶层为 indicators 数组。
+2. 每个指标包含 indicator_id、name、aliases、definitions、evidence、source_chunk_ids、candidate_ids。
+3. evidence 是指标身份和定义证据，不自动证明两个指标之间有关系。已有溯源字段是程序生成的，
+   本轮仅输出 kind、quote、observation，不复制位置、match_method 或 extracted_quote。
+4. candidate_ids 和 source_chunk_ids 只用于追溯，不是关系端点。
+
+关系判断规则（A 为 subject_id，B 为 object_id）：
+1. VARIANT_OF：A 是 B 的明确变体，保留核心思想或公式结构，改变权重、参数、时间窗口、对象或归一化方式。
+2. DERIVED_FROM：A 在概念、公式或设计上直接来源于 B，并有超出简单变体的明确改动。
+   同一方向不同时输出 VARIANT_OF 和 DERIVED_FROM；直接来源不能仅凭名称或公式相似推断。
+3. IMPROVES_ON：A 明确针对 B 的缺陷、偏差或适用问题改进。区分作者设计目标与已经验证的效果，
+   在 rationale_summary 中说明改善维度及适用条件；新指标不自动优于旧指标。
+4. ALTERNATIVE_TO：A、B 在明确评价目标和条件下可互为替代或竞争方案。
+   仅共同出现、一起比较或数值高相关不足以证明可替代；描述替代成立的条件。
+   此关系对称，每个无序指标对只输出一次；按输入清单顺序将靠前指标放在 subject_id。
+5. COMPONENT_OF：A 作为子指标、输入指标或组成部分纳入 B，方向为组成部分指向整体。
+   普通变量不自动成为指标；A、B 都必须在固定清单中。
+6. 只输出文献支持的直接关系，不补传递关系或镜像关系，不输出自关系。
+   VARIANT_OF/DERIVED_FROM 可与有独立依据的 IMPROVES_ON 等关系并存。
+
+【字段填写规则】
+indicator_relations 填写规则：
+每条记录对应一个有据关系，同一 subject_id、predicate、object_id 只出现一次，多处依据汇总到 evidence。
+不同标签分别成记录。无关系时返回 []，不输出 predicate=null 或 no_relation 字段。
+
+subject_id 填写规则：
+填写清单中的统一 indicator_id，表示 A。不要使用名称、章节 ID、候选 ID 或重新生成 ID。
+
+object_id 填写规则：
+填写清单中的统一 indicator_id，表示 B，必须与 subject_id 不同。按关系定义选择方向。
+
+predicate 填写规则：
+只填写 VARIANT_OF、DERIVED_FROM、IMPROVES_ON、ALTERNATIVE_TO、COMPONENT_OF 之一，不输出数组。
+
+assertion_mode 填写规则：
+explicit 表示原文明示关系；inferred 表示需结合提供的证据推断，必须如实标记。
+不能用外部常识或缺失前提补关系。
+
+evidence 填写规则：
+每条关系至少一条，支持两端身份及两者之间的具体关系；可用多条原文解决指代，但不可拼接成一条 quote。
+仅有指标各自名称或定义的证据并不足以证明关系。原有证据可复用，但须核对本次章节语境。
+文字逐字引用，视觉通过实际图片 URL 溯源，按下方证据规则输出 kind、quote、observation。
+
+rationale_summary 填写规则：
+inferred 必填，用中文说明“这是推断”，按本条 evidence 数组下标（从 0 开始）说明根据哪些事实得出关系。
+explicit 可为 null；需要说明改进目标、效果、替代条件、应用范围时用中文简短说明。
+必要前提和条件直接写在此字段，不输出 assumptions、scope、origin_status 或归并判断字段。
+""" + EVIDENCE_RULES

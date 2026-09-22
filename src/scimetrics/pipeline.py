@@ -291,13 +291,10 @@ def build_graph(
             mapping.append({"indicator_id": iid, **group})
         return {"discovery": {"indicators": indicators}, "merge_map": mapping}
 
-    def relation_parts(state, *, retained_only=False):
-        if retained_only:
-            parts = []
-            for chunk in state["chunks"]:
-                parts.extend(content(state, chunk))
-        else:
-            parts = content(state)
+    def relation_parts(state):
+        parts = []
+        for chunk in state["chunks"]:
+            parts.extend(content(state, chunk))
         parts.append(
             {
                 "type": "text",
@@ -305,18 +302,18 @@ def build_graph(
                 + json.dumps(state["discovery"], ensure_ascii=False),
             }
         )
-        if retained_only and (
+        if (
             sum(len(p["text"]) for p in parts if p["type"] == "text") > settings.max_chars
             or sum(p["type"] == "image_url" for p in parts) > settings.max_images
             or len(json.dumps(parts).encode()) > settings.max_body_bytes
         ):
-            raise ValueError("PI 保留章节与指标清单的总输入超过资源限额；不会截断")
+            raise ValueError("关系抽取的保留章节与指标清单总输入超过资源限额；不会截断")
         return parts
 
     def pi_relation(state):
         if not state["discovery"]["indicators"]:
             return {"paper_relations": []}
-        parts = relation_parts(state, retained_only=True)
+        parts = relation_parts(state)
         relations = client.call(
             "extract_pi_relation", prompts.EXTRACT_PI, parts, PaperRelations
         ).model_dump()["paper_relations"]
@@ -344,19 +341,38 @@ def build_graph(
     def ii_relation(state):
         relations = []
         known = {i["indicator_id"] for i in state["discovery"]["indicators"]}
+        # 如果没有候选指标或只有一个候选指标，直接返回空关系，应为关系抽取要求至少两个指标才能判断关系
         if len(known) >= 2:
             parts = relation_parts(state)
             relations = client.call(
                 "extract_ii_relation", prompts.EXTRACT_II, parts, IndicatorRelations
             ).model_dump()["indicator_relations"]
-            if any(
-                r["subject_id"] not in known
-                or r["object_id"] not in known
-                or r["subject_id"] == r["object_id"]
-                for r in relations
-            ):
-                raise ValueError("指标关系端点未知或存在自关系")
-            validate(relations, state, parts, "extract_ii_relation")
+            order = {i["indicator_id"]: n for n, i in enumerate(state["discovery"]["indicators"])}
+            seen = set()
+            # 检查指标与指标关系数据合法性
+            for index, relation in enumerate(relations):
+                subject, predicate, obj = relation["subject_id"], relation["predicate"], relation["object_id"]
+                # 验证端点是否在已发现指标中
+                if subject not in known or obj not in known or subject == obj:
+                    raise ValueError(f"indicator_relations[{index}] 端点未知或自关系：{subject} {predicate} {obj}")
+                # 规范化 ALTERNATIVE_TO 的AB与BA的重复对称关系
+                if predicate == "ALTERNATIVE_TO" and order[subject] > order[obj]:
+                    subject, obj = obj, subject
+                    relation["subject_id"], relation["object_id"] = subject, obj
+                key = (subject, predicate, obj)
+                # 检查重复关系（含对称关系反向重复）
+                if key in seen:
+                    raise ValueError(f"indicator_relations[{index}] 重复关系（含对称关系反向重复）：{key}，请汇总证据")
+                seen.add(key)
+            # 检查 VARIANT_OF 和 DERIVED_FROM 的冲突关系
+            for subject, predicate, obj in seen:
+                if predicate == "VARIANT_OF" and (subject, "DERIVED_FROM", obj) in seen:
+                    raise ValueError(f"{subject} -> {obj} 不能同时标记 VARIANT_OF 和 DERIVED_FROM")
+            validate(
+                relations, state, parts, "extract_ii_relation",
+                source_ranges=[(c["start"], c["end"]) for c in state["chunks"]],
+            )
+            relations.sort(key=lambda r: (order[r["subject_id"]], order[r["object_id"]], r["predicate"]))
         relations = unique(relations)
         data = {
             "status": "extracted_unverified",
