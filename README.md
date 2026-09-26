@@ -1,51 +1,60 @@
-# 科学计量指标多模态抽取
+# 科学计量指标知识图谱与证据问答
 
-从论文 Markdown 发现具名科学计量指标，完成文内归并，抽取论文—指标（PI）及指标—指标（II）关系。使用 DeepSeek、LangGraph、SQLite checkpoint，可选 LangSmith 追踪。
+项目包含三个模块，按数据流依次运行：**IE 抽取 → graph_db 入库 → app 问答**。模块之间通过结果文件和 Neo4j 解耦，可独立运行；问答不需要重新抽取论文。
 
-抽取流程不执行 PDF/MinerU 解析或跨论文归并，也没有独立的公式、局限性抽取模块。Neo4j 入库由独立的 `graph_db` 模块完成。结果标记为 `extracted_unverified`：来源定位通过不代表语义判断已验证。
+| 模块 | 目录 | 输入 | 输出 |
+| --- | --- | --- | --- |
+| IE：信息抽取 | `src/ie` | 已解析论文 Markdown 与图片 URL | 指标、PI/II 关系及证据 `result.json` |
+| graph_db：图谱入库 | `src/graph_db` | `result.json`、原始 Markdown | Neo4j 节点和直接关系边 |
+| app：知识问答 | `src/app` | 用户问题、论文 ID、已入库图谱 | SSE 流式回答、执行轨迹和证据引用 |
 
-## 项目结构
+当前范围是单篇论文指标发现、文内归并、关系抽取、入库与证据问答。不包含 PDF/MinerU 解析、独立公式/局限性抽取或跨论文实体归并。`extracted_unverified` 表示抽取结果尚未经过完整语义复核；原文定位或引用归属通过，不等于关系判断必然正确。
+
+## 项目结构与环境
 
 ```text
 project/
-├── AGENTS.md                   # 提示词格式及开发约定
-├── pyproject.toml / uv.lock     # Python 依赖与锁文件
-├── Makefile                    # 常用命令
-├── run.toml                    # 运行参数
-├── .env.example                # 密钥、服务地址及追踪配置示例
-├── data/                       # 已解析的 Markdown
-├── src/ie/
-│   ├── __init__.py
-│   ├── cli.py                  # 配置、运行、恢复、历史重放
-│   ├── pipeline.py             # State、节点及图编排
-│   ├── models.py               # 模型输出 schema
-│   ├── prompts.py              # 总纲＋逐字段规则
-│   └── utils/
-│       ├── __init__.py
-│       ├── document.py         # 图片、章节、多模态消息、文件工具
-│       ├── evidence.py         # 来源定位与失败诊断
-│       ├── merge.py            # 归并结构及引用校验
-│       ├── client.py           # DeepSeek JSON 调用
-│       └── observability.py    # LangSmith 追踪
-├── src/graph_db/               # Neo4j 数据转换与事务导入
-│   ├── __init__.py
-│   └── neo4j_import.py
-├── outputs/                    # run.toml 指定的输出目录
+├── src/
+│   ├── ie/                       # 信息抽取工作流
+│   │   ├── cli.py                # 运行、检查点、重放
+│   │   ├── pipeline.py           # LangGraph 图、节点和 State
+│   │   ├── models.py / prompts.py # 输出契约和提示词
+│   │   └── utils/                # 文档、模型调用、证据、归并、追踪
+│   ├── graph_db/
+│   │   └── neo4j_import.py        # 数据转换与事务写入
+│   └── app/
+│       ├── backend/
+│       │   ├── main.py           # FastAPI 与 SSE
+│       │   ├── agent.py          # 检索 Agent
+│       │   ├── store.py          # Neo4j 只读工具
+│       │   └── schemas.py / prompts.py
+│       └── frontend/
+│           ├── src/App.vue
+│           ├── src/api.ts / types.ts / main.ts / style.css
+│           ├── vite.config.ts / tsconfig.json
+│           └── package.json / pnpm-lock.yaml / pnpm-workspace.yaml
+├── run.toml                      # IE 运行参数
+├── .env.example                  # 密钥、数据库和问答配置示例
+├── Makefile                      # 统一命令入口
+├── pyproject.toml / uv.lock       # Python 依赖
+├── AGENTS.md                     # 开发约定
+├── data/                         # 原始 Markdown
+├── outputs/                      # 抽取和转换结果
 └── .debug/
-    ├── checkpoints.sqlite      # 检查点历史与任务配置
-    └── .reports/               # 状态查看报告
+    ├── checkpoints.sqlite        # IE 检查点历史与任务配置
+    └── .reports/                 # IE 状态查看报告
 ```
 
-## 安装与输入
+- Python 3.13+、uv：三个模块的 Python 依赖。
+- Node.js 22.12+、pnpm 11.2.2：app 前端。
+- Neo4j：graph_db 和 app 使用；可运行在本地 Docker 中。
+- DeepSeek API：IE 抽取和 app 问答使用；纯转换/入库不调用模型。
 
-要求 Python 3.13+ 和 uv。
+在项目根目录运行命令。首次安装可用 `make install`（Python）或 `make qa-install`（Python＋前端）。首次配置时将 `.env.example` 复制为 `.env` 并填写，已有 `.env` 时直接编辑，勿覆盖已有配置。IE 参数放在 `run.toml`；模型密钥和 Neo4j 密码只保存在后端环境中。
 
-```bash
-make install
-cp .env.example .env
-# 在 .env 填写 DEEPSEEK_API_KEY，在 run.toml 设置 input
-make start
-```
+## 1. IE：论文信息抽取
+
+### 输入与运行入口
 
 输入必须是已有 `.md` 文件；`make run` 也支持目录批处理。图片必须使用模型服务能访问的 HTTP(S) URL，例如：
 
@@ -55,7 +64,21 @@ make start
 
 不下载图片、不读取本地图片、不发送 Base64。支持普通 Markdown 图片、引用式图片和 HTML img；代码中的图片语法不作为真实图片。
 
-## 流程
+### Agent 架构与状态流转
+
+IE 的编排入口是 `pipeline.py::build_graph`，没有单独的 `agent.py`。它是固定工作流式的多模态抽取 Agent：代码决定节点次序和章节循环，模型在节点内按 Schema 分类、发现指标、判断归并和抽取关系，不自主选择外部工具或生成执行代码。
+
+| 层次 | 实现 | 职责 |
+| --- | --- | --- |
+| 运行控制 | `cli.py` | 读取配置、创建模型客户端、启动/恢复/重放任务 |
+| 图编排 | `pipeline.py` | LangGraph StateGraph、节点路由、状态更新、结果落盘 |
+| 模型契约 | `prompts.py`、`models.py` | “总纲＋字段填写规则”提示词、Pydantic 输出 Schema |
+| 模型调用 | `utils/client.py` | DeepSeek 多模态 JSON 请求、输出结束状态检查 |
+| 确定性工具 | `utils/document.py`、`utils/evidence.py`、`utils/merge.py` | 文档分章、消息构造、来源定位、归并约束 |
+| 持久化与诊断 | CLI 中的 SQLite checkpointer、`utils/observability.py` | 检查点恢复、可选 LangSmith 追踪 |
+
+共享 `State` 从原文逐步积累图片、章节、候选指标、统一指标和关系。节点返回更新字典；发现节点不会原地修改输入，只有模型请求、结构检查、证据检查全部成功后才提交本章结果。
+
 
 ```mermaid
 flowchart TD
@@ -83,7 +106,7 @@ flowchart TD
 
 `chunks` 的 ID 沿用原章节编号，因此跳过章节后编号不连续。章节超过限额时报错，不自动拆分或截断。图片分类仍在一个节点内循环，不具备逐图恢复。
 
-### 发现与归并
+#### 发现与归并
 
 discover 输出 `indicator_id、name、aliases、definition、evidence`。程序将临时 ID 改为 `C0007_I001` 等文内候选 ID。无定义时 `definition=null`，无指标时 `indicators=[]`；泛称和普通变量不应成为指标。
 
@@ -100,7 +123,7 @@ source_chunk_ids, candidate_ids
 
 `definitions` 是列表。`merge_map` 保存 `canonical_name`、分组成员、依据引用、补充证据及复核记录；`name` 属于最终指标，`canonical_name` 属于归并映射。关系节点只收到 `discovery`，不接收整个 State 或 merge_map。
 
-### PI：每个指标一条判定
+#### PI：每个指标一条判定
 
 输出字段：
 
@@ -111,9 +134,9 @@ no_relation_reason, no_relation_detail
 
 必须覆盖全部指标，无遗漏、重复或新增 ID。有依据时按 `PROPOSES > MODIFIES > APPLIES` 选一个主关系：提出后又应用，仅输出 PROPOSES。无关系时 `predicate=null`、`assertion_mode=null`，记录“仅背景提及／未实际应用／证据不足”及具体原因。有关系时两个无关系原因字段为 null。
 
-有关系至少一条证据；仅背景提及和未实际应用也需相关证据，证据不足允许 `evidence=[]`。无关系记录是审计记录，不应作为图谱边入库。PROPOSES 是基于本文证据的判断，不代表已外部核实全球首创。
+有关系至少一条证据；仅背景提及和未实际应用也需相关证据，证据不足允许 `evidence=[]`。无关系记录不生成 PROPOSES/MODIFIES/APPLIES 业务边；graph_db 将其理由和证据保存在辅助 MENTIONS 边上。PROPOSES 是基于本文证据的判断，不代表已外部核实全球首创。
 
-### II：有据的指标间关系
+#### II：有据的指标间关系
 
 输出字段：
 
@@ -135,7 +158,7 @@ subject_id, predicate, object_id, assertion_mode, evidence, rationale_summary
 
 PI 和 II 均区分 `explicit` 与 `inferred`。推断必须提供非空 `rationale_summary`，提示词要求说明“这是推断”，并按本条 evidence 下标指出依据。必要前提、适用条件和改进目标写入摘要，不单设 assumptions、scope 或 origin_status。II 不读取 PI 判定，不能因为本文同时使用两个指标就假定它们有关系。
 
-## 证据校验与输出
+### 证据校验与输出
 
 模型生成的证据为 `kind、quote、observation`。文字 quote 须逐字引用，保留大小写、OCR 拼写及 LaTeX；视觉 quote 为实际图片 URL，observation 描述区域及所见。
 
@@ -161,7 +184,7 @@ chunks, skipped_sections
 
 报告会覆盖；执行 make inspect 才会导出所选 State 字段与任务错误。SQLite 保存历史检查点，报告 JSON 不是恢复依据。历史错误报告不表示本轮仍失败；重跑可能覆盖同名结果文件。
 
-## 配置
+### 配置
 
 参数统一放在 run.toml 的 `[run]`，密钥放在 `.env`。示例：
 
@@ -192,29 +215,16 @@ field = "all"
 
 `field` 可选 all、raw_content、images、chunks、skipped_sections、chunk_discoveries、discovery、merge_map、paper_relations、indicator_relations、extraction。
 
-## 命令与检查点
+### 检查点与恢复
 
-| 命令 | 行为 |
-| --- | --- |
-| make help | 显示使用提示 |
-| make install | uv sync 安装依赖 |
-| make run | 从头完整执行，无持久化 checkpoint，忽略暂停点；支持目录批处理 |
-| make start | 为新 thread_id 启动单篇任务，保存检查点，遵循暂停点 |
-| make inspect | 查看最新状态，不调用模型 |
-| make resume | 从最新检查点继续，遵循 stop_before/stop_after |
-| make continue | 从最新检查点继续，临时忽略全部暂停点，仍保存检查点 |
-| make replay | 从历史检查点重跑 replay_node 及后续流程，遵循暂停点 |
-
-替换配置文件：
+IE 的 Make 命令统一读取 `run.toml`；完整命令表见文末。CLI 仅接受 `--config`、`--action` 和帮助选项，Make 动作覆盖 TOML 的 action。
 
 ```bash
 make resume CONFIG=another.toml
 uv run ie --config run.toml --action inspect
 ```
 
-CLI 仅接受 `--config`、`--action` 和帮助选项。Make 的动作覆盖 TOML 的 action。
-
-### 按阶段运行
+#### 按阶段运行
 
 ```bash
 make start       # 新任务：prepare 完成后暂停
@@ -232,7 +242,7 @@ make resume      # II 完成，保存最终结果
 
 分类和整个 merge 各自仍是一个执行步，节点内部中途失败会重做整个节点。图步数上限为 10000。不要并发运行相同 thread_id。
 
-### 重跑 PI 或 II
+#### 重跑 PI 或 II
 
 将 replay_node 设置为目标节点，例如：
 
@@ -249,29 +259,45 @@ replay 从同一 thread_id 的历史中，选择最近一个 next 包含目标�
 
 replay 仍遵循暂停点；当前 PI 后有暂停，II 完成则写结果。每次 replay 都重新选择历史起点，resume 不使用 replay_node。服务调用会重新产生费用，最终文件可能覆盖，旧检查点不会撤销文件等外部副作用。
 
-### 配置变更
+#### 配置变更
 
 start 固定保存输入、输出、模型及输入文件哈希。resume/replay 使用保存的输入、输出和模型，但使用当前 TOML 的五项资源限额、暂停配置等。更改原始 Markdown 会拒绝恢复；需新 thread_id。修改代码/提示词只影响后续或重跑的节点，不自动更新已完成结果。不提供旧 State/schema 迁移。
 
-## LangSmith 与开发约定
+### LangSmith 追踪
 
-`.env.example` 列出 DEEPSEEK_API_KEY、DEEPSEEK_BASE_URL、LANGSMITH_TRACING、LANGSMITH_API_KEY、LANGSMITH_PROJECT、LANGSMITH_ENDPOINT。开启 LangSmith 后，模型输入、输出和图片 URL 等会上传追踪服务；LangSmith 用于诊断，SQLite 用于恢复，两者不能互相替代。
+`.env.example` 提供 LANGSMITH_TRACING、LANGSMITH_API_KEY、LANGSMITH_PROJECT、LANGSMITH_ENDPOINT。启用后，IE 的模型输入、输出及图片 URL 等会上传追踪服务。LangSmith 用于诊断，SQLite checkpoint 用于恢复，两者不能互相替代。
 
-提示词按“总纲＋字段填写规则”组织。项目不新增测试文件或测试代码，修改使用语法、导入、配置、图构建及必要的实际数据检查验证；未调用模型的检查不代表已验证抽取准确率。
+## 2. graph_db：单篇论文图谱入库
 
-## 单篇论文导入 Neo4j
-
-抽取包已由 `src/scimetrics` 改名为 `src/ie`（information extraction），命令入口为 `ie`；原有 `make run/start/inspect/resume/continue/replay` 用法不变。执行 `uv sync` 更新依赖和入口。现有 JSON 与 checkpoint 不做迁移或清空。
-
-新增目录：
-
-```text
-src/graph_db/
-├── __init__.py
-└── neo4j_import.py
-```
+### 职责与数据转换
 
 该模块独立读取最终 `result.json`，不调用抽取模型，也不实现问答。使用 `graph_db` 包名避免与官方 `neo4j` 驱动重名。
+
+入口为 `neo4j_import.py`，模块不包含 Agent。它使用确定性的 Python 转换和参数化 Cypher，不调用模型。
+
+```mermaid
+flowchart TD
+    A[result.json + 原始 Markdown] --> B[build_payload：校验与转换]
+    B --> C[paper / indicators / mentions / relations]
+    C --> D{dry-run?}
+    D -->|是| E[打印统计，可保存 payload JSON]
+    D -->|否| F[import_payload：连接数据库、建立唯一约束]
+    F --> G[_replace_paper：单事务替换该论文数据]
+    G --> H[Paper / Indicator 节点与直接关系边]
+```
+
+`build_payload` 读取论文标题和文件哈希，为指标添加论文命名空间，检查 PI 覆盖、II 端点及关系冲突，并将证据转换成可写入 Neo4j 的属性。返回值：
+
+```text
+paper       = {id, title, source_file, source_sha256, result_sha256, ...}
+indicators  = [{id, props}]
+mentions    = [{id: 目标指标ID, props}]
+relations   = [{subject, object, kind: PI或II, predicate, props}]
+```
+
+`props` 是节点/关系属性。`kind` 用于选择起点节点类型，`predicate` 决定实际边类型；转换过程只在内存中运行，真正写库发生在 `import_payload` 中。
+
+### 运行与转换预览
 
 先启动 Neo4j 数据库，并在 `.env` 配置 `NEO4J_URI`、`NEO4J_USER`、`NEO4J_PASSWORD`、`NEO4J_DATABASE`（参考 `.env.example`）。导入账户需要写入和建立唯一约束的权限。
 
@@ -291,6 +317,8 @@ make neo4j-import RESULT=outputs/result.json SOURCE="data/paper.md" PAPER_ID=pap
 ```
 
 `--title` 可指定标题，默认读取 Markdown 第一个一级标题。建议显式指定稳定的 `--paper-id`；省略时使用 Markdown 内容 SHA256，修改 Markdown 会被视为新论文。文件 SHA256、结果 SHA256 和源路径保存在 Paper 节点。已有证据的 source_spans 会与所提供的原文核对，但导入不会重新验证抽取的语义真实性。
+
+### 图谱模型与证据存储
 
 图谱模型只有两类节点：
 
@@ -316,9 +344,15 @@ PI 直接写为 `Paper -[:PROPOSES|MODIFIES|APPLIES]-> Indicator`（每个指标
 
 每篇论文仍通过辅助 `MENTIONS` 连接全部指标。仅无有效 PI 的 MENTIONS 保存 no_relation_reason、no_relation_detail、rationale_summary 和 evidence_*；有效 PI 的证据只写在实际业务关系上。展示主图时可隐藏 MENTIONS。
 
+### 重复导入与事务
+
 重复导入相同 paper_id，会在单个事务内删除该导入器拥有的旧指标及关联边并重建。也会清理该论文旧版 Assertion/Evidence 节点；其他论文和其他导入器数据不受影响。不会自动删除数据库级旧约束，避免影响其他尚未重导入的论文。自动生成节点上的人工附加关系会随删除重建丢失，请另行保存人工标注。唯一约束单独建立；数据事务失败会回滚，保留此前图谱。
 
 成功输出论文、指标、MENTIONS、PI/II、无关系记录数量；evidence_entries 是所有节点和关系属性内的证据条目总数，同一证据被多处引用时分别计数。`--dry-run` 不连接数据库，不代表写入成功。
+
+### 在 Neo4j Browser 查看
+
+打开 http://localhost:7474/browser/，登录后执行以下查询。
 
 查看论文的业务关系（隐藏 MENTIONS）：
 
@@ -345,9 +379,9 @@ WHERE m.no_relation_reason IS NOT NULL
 RETURN i.name, m.no_relation_reason, m.no_relation_detail, m.evidence_quotes
 ```
 
-前端悬浮关系时可显示 type(r)、assertion_mode 和 evidence_quotes；点击详情时解析 evidence_json，展示全部引句、视觉观察及来源位置。稳定定位使用 relation_id。当前仅实现数据存储，尚未实现前端悬浮事件或问答界面；Neo4j Browser 不会因属性存在就自动生成定制的悬浮框。
+前端悬浮关系时可显示 type(r)、assertion_mode 和 evidence_quotes；点击详情时解析 evidence_json，展示全部引句、视觉观察及来源位置。稳定定位使用 relation_id。graph_db 仅负责存储；app 已实现问答及证据卡片，但尚未实现交互图谱的关系悬浮框。Neo4j Browser 不会因属性存在就自动生成定制的悬浮框。
 
-## Vue + TypeScript 知识图谱问答
+## 3. app：前后端分离的证据问答
 
 前端 Vue 3 + TypeScript + Vite（pnpm），后端 FastAPI + LangGraph。后端读取最新导入器生成的 Paper、Indicator 与直接 PI/II 关系，不兼容旧 Assertion/Evidence 图结构。不会写入或重新抽取图谱。
 
@@ -390,28 +424,47 @@ make qa-frontend
 
 Vite 代理 `/api` 到后端，无需开放跨域。后端地址不同时，启动前端前设置 QA_BACKEND_URL。生产构建运行 `make qa-build`，产物位于 src/app/frontend/dist；生产部署应配置同源 `/api` 反向代理。`pnpm --dir src/app/frontend run preview` 可本地预览构建，preview 同样配置代理。
 
-### 目录
+### 后端 Agent 架构
 
-```text
-src/app/
-├── backend/
-│   ├── main.py       # 生命周期、接口、错误映射、并发限制
-│   ├── schemas.py    # 用户请求、工具调用、回答 schema
-│   ├── prompts.py    # 检索规划与有引用的回答生成
-│   ├── store.py      # 固定、参数化的只读 Cypher
-│   └── agent.py      # LangGraph 有界检索与引用检查
-└── frontend/
-    ├── src/App.vue   # 论文选择、提问、回答、引用与检索记录
-    ├── src/api.ts    # fetch SSE 增量分帧与错误处理
-    ├── src/types.ts  # 接口与前端状态类型
-    ├── src/main.ts
-    ├── tsconfig.json
-    ├── pnpm-lock.yaml
-    ├── src/style.css
-    └── vite.config.ts
+编排入口是 `backend/agent.py::KnowledgeAgent`。它是有界的工具调用式 Agent：模型负责选择检索工具与参数、判断是否补查、生成回答；代码限制工具集合、论文范围、调用次数并核对引用。`store.py` 执行固定的参数化只读 Cypher，模型不能执行任意查询。
+
+| 层次 | 文件 | 职责 |
+| --- | --- | --- |
+| API 与流传输 | `backend/main.py` | FastAPI 生命周期、配置、并发限制、工作线程、有界队列、SSE、取消信号 |
+| Agent 与状态 | `backend/agent.py` | LangGraph 四节点编排、模型 token 流、引用校验 |
+| 工具实现 | `backend/store.py` | 指标详情、关系、无关系理由三个查询模板 |
+| 模型契约 | `backend/prompts.py`、`backend/schemas.py` | 检索计划、工具参数、结构化回答 |
+| 页面与交互 | `frontend/src/App.vue` | 论文选择、提问、阶段轨迹、回答与证据面板 |
+| 流协议与类型 | `frontend/src/api.ts`、`frontend/src/types.ts` | SSE 分帧、UTF-8 增量解码、接口与页面状态类型 |
+
+`stream()` 先加载论文和指标目录，然后进入以下图。图中没有 SQLite checkpointer，每次提问使用独立内存状态，不复用 IE 的 checkpoint。
+
+```mermaid
+flowchart TD
+    S[加载论文与指标目录] --> P[plan：选择工具与参数]
+    P -->|有工具调用| R[retrieve：执行只读检索]
+    P -->|无调用或需澄清| A[answer]
+    R -->|首轮完成| V[review：判断是否补查]
+    V -->|有新的工具调用| R
+    V -->|足够或需澄清| A
+    R -->|第二轮完成| A
+    A --> G[流式生成并核对引用]
+    G --> E[结束]
 ```
 
-### 数据流
+| State 字段 | 内容 |
+| --- | --- |
+| question、paper、catalog | 用户问题、选定论文、用于名称/别名匹配的指标目录 |
+| plan | explanation、clarification、calls；工具调用只能引用目录中的指标 ID |
+| facts | 工具取回的事实，包含稳定 ID 与 citation_ids |
+| sources | E1 等本次请求内的引用编号、事实 ID、论文和原始 evidence |
+| trace、seen_calls、rounds | 工具执行记录、已调用参数、检索轮次 |
+| warnings | 检索数量或上下文截断等覆盖范围提示 |
+| answer | status、claims、limitation、follow_up |
+
+模型的 Plan 最多给出三个调用；review 在首轮后运行一次，有缺口时再查一轮。clarification 非空时跳过工具直接询问用户；没有事实时直接返回资料不足，不调用回答模型。当前图最多三次模型请求：plan、review、answer；retrieve 本身只查询数据库，不调用模型。
+
+### 前后端与流式数据流
 
 ```mermaid
 flowchart TD
@@ -474,6 +527,53 @@ data: {"stage":"thinking","label":"思考中","detail":"识别指标与选择检
 
 支持“停止生成”：前端中止 fetch，后端收到断连后停止后续工具与模型调用，并在模型下一个流片段或超时处关闭流。已发出的请求不能保证立即取消供应商计算或计费；并发名额在工作线程实际结束后释放。后端有界事件队列避免慢客户端造成无限缓存，并发送心跳；反向代理应关闭 SSE 响应缓冲并设置足够长的读取超时。前端等待上限六分钟，单次模型超时由 QA_MODEL_TIMEOUT 控制。
 
-### 检查
+## 4. Makefile 命令总览
 
-遵循项目约定，不新增测试代码。使用导入检查、OpenAPI 检查、前端生产构建和真实服务读取/问答验证。没有公式、局限性专用数据和跨论文实体归并时，不承诺完整回答这些问题。
+| 命令 | 模块 | 实际行为 | 前置条件/说明 |
+| --- | --- | --- | --- |
+| `make` / `make help` | 全局 | 显示常用入口 | 默认目标为 help |
+| `make install` | 全局 | `uv sync` | 安装全部 Python 依赖，不安装前端依赖 |
+| `make run` | IE | 从头完整抽取，无持久化 checkpoint | 可处理单文件或目录；忽略暂停点 |
+| `make start` | IE | 为新 thread_id 启动单篇任务并保存检查点 | 遵循暂停点；已有 thread_id 会拒绝重新 start |
+| `make inspect` | IE | 读取最新检查点、导出所选状态与任务错误 | 不调用模型；查看范围由 field 决定 |
+| `make resume` | IE | 从最新检查点继续 | 遵循 stop_before/stop_after；失败章节重试 |
+| `make continue` | IE | 从最新检查点执行剩余流程 | 本次忽略全部暂停点，仍写检查点，不修改 TOML |
+| `make replay` | IE | 从历史中最近一个待执行 replay_node 的检查点重跑 | 执行目标及后续节点，遵循暂停点；保留旧历史 |
+| `make neo4j-import` | graph_db | 转换结果并事务写入 Neo4j | 必须传 SOURCE；重复 PAPER_ID 会替换该论文数据 |
+| `make qa-install` | app | `uv sync`＋`pnpm install --frozen-lockfile` | 安装 Python 与锁定版本的前端依赖 |
+| `make qa-backend` | app | `uv run qa-backend` | 启动 127.0.0.1:8000 的 FastAPI 服务 |
+| `make qa-frontend` | app | `pnpm ... run dev` | 启动 127.0.0.1:5173，代理 API 到后端 |
+| `make qa-build` | app | `vue-tsc --noEmit`＋`vite build` | 类型检查后构建到 src/app/frontend/dist，不启动服务 |
+
+### Make 参数
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `UV` | `uv` | 替换 Python 包管理/运行命令 |
+| `CONFIG` | `run.toml` | 仅 IE 命令读取此配置文件，不控制 app 或 Neo4j 导入 |
+| `RESULT` | `outputs/result.json` | neo4j-import 的抽取结果路径 |
+| `SOURCE` | 空 | neo4j-import 的原始 Markdown 路径，需显式填写 |
+| `PAPER_ID` | 空 | 导入论文 ID；未填时按 Markdown SHA256 生成 |
+
+```bash
+make resume CONFIG=another.toml
+make neo4j-import RESULT=outputs/result.json SOURCE="data/paper.md" PAPER_ID=paper-001
+```
+
+Make 中没有 dry-run 目标。只转换不入库时使用 `uv run neo4j-import ... --dry-run --payload-output ...`，详见 graph_db 模块。仅检查前端类型可执行 `pnpm --dir src/app/frontend run typecheck`。
+
+### 从抽取到问答的最短路径
+
+```bash
+make qa-install
+# 填写 .env、run.toml；启动 Neo4j
+make start
+make continue
+make neo4j-import RESULT=outputs/result.json SOURCE="data/paper.md" PAPER_ID=paper-001
+```
+
+上面的 SOURCE 要替换为与 IE 输入一致的实际文件。接着在两个终端分别执行 `make qa-backend`、`make qa-frontend`，访问 http://127.0.0.1:5173 。如果已有结果或已入库，可从对应模块开始，不必从头运行。
+
+## 开发与验证约定
+
+提示词采用“总纲＋字段填写规则”，保持实际输入、字段、空值规则与 Schema 一致。项目不新增测试文件或测试代码；通过语法、导入、配置、图构建、TypeScript 类型检查、生产构建和必要的实际数据检查验证。未调用模型的检查不代表已验证语义准确率。
