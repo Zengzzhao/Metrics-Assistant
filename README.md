@@ -346,3 +346,134 @@ RETURN i.name, m.no_relation_reason, m.no_relation_detail, m.evidence_quotes
 ```
 
 前端悬浮关系时可显示 type(r)、assertion_mode 和 evidence_quotes；点击详情时解析 evidence_json，展示全部引句、视觉观察及来源位置。稳定定位使用 relation_id。当前仅实现数据存储，尚未实现前端悬浮事件或问答界面；Neo4j Browser 不会因属性存在就自动生成定制的悬浮框。
+
+## Vue + TypeScript 知识图谱问答
+
+前端 Vue 3 + TypeScript + Vite（pnpm），后端 FastAPI + LangGraph。后端读取最新导入器生成的 Paper、Indicator 与直接 PI/II 关系，不兼容旧 Assertion/Evidence 图结构。不会写入或重新抽取图谱。
+
+### 运行
+
+先启动 Neo4j 并导入至少一篇论文。在项目根目录 `.env` 配置：
+
+```dotenv
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=你的密码
+NEO4J_DATABASE=neo4j
+DEEPSEEK_API_KEY=你的密钥
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+QA_MODEL=deepseek-flash
+QA_MODEL_TIMEOUT=60
+QA_MAX_OUTPUT_TOKENS=12000
+QA_THINKING=disabled
+```
+
+模型名与服务端实际提供的模型保持一致。问答默认使用 DeepSeek 非思考模式，降低规划阶段长思考占用输出预算的风险；如配置 enabled，应增加输出预算和超时。该配置独立于 IE 抽取流程。开关依据 [DeepSeek 官方思考模式说明](https://api-docs.deepseek.com/guides/thinking_mode/)。修改配置后重启后端。API 密钥只由后端加载，Vue 不包含数据库账号或模型密钥。
+
+在项目根目录安装依赖（需要 Python 3.13 与 Node.js 22.12+、pnpm 11.2.2）：
+
+```bash
+make qa-install
+```
+
+两个终端分别运行：
+
+```bash
+make qa-backend
+```
+
+```bash
+make qa-frontend
+```
+
+打开 http://127.0.0.1:5173 。后端为 http://127.0.0.1:8000 ，接口文档为 http://127.0.0.1:8000/docs 。本地默认仅监听 127.0.0.1，未实现登录鉴权，不作为公网部署配置。
+
+Vite 代理 `/api` 到后端，无需开放跨域。后端地址不同时，启动前端前设置 QA_BACKEND_URL。生产构建运行 `make qa-build`，产物位于 src/app/frontend/dist；生产部署应配置同源 `/api` 反向代理。`pnpm --dir src/app/frontend run preview` 可本地预览构建，preview 同样配置代理。
+
+### 目录
+
+```text
+src/app/
+├── backend/
+│   ├── main.py       # 生命周期、接口、错误映射、并发限制
+│   ├── schemas.py    # 用户请求、工具调用、回答 schema
+│   ├── prompts.py    # 检索规划与有引用的回答生成
+│   ├── store.py      # 固定、参数化的只读 Cypher
+│   └── agent.py      # LangGraph 有界检索与引用检查
+└── frontend/
+    ├── src/App.vue   # 论文选择、提问、回答、引用与检索记录
+    ├── src/api.ts    # fetch SSE 增量分帧与错误处理
+    ├── src/types.ts  # 接口与前端状态类型
+    ├── src/main.ts
+    ├── tsconfig.json
+    ├── pnpm-lock.yaml
+    ├── src/style.css
+    └── vite.config.ts
+```
+
+### 数据流
+
+```mermaid
+flowchart TD
+    A[Vue：论文 ID 与用户问题] --> B[POST /api/chat]
+    B --> C[加载所选论文和指标目录]
+    B -. SSE 阶段事件 .-> U[Vue 实时执行轨迹]
+    C --> D[LLM 规划：选择检索工具及参数]
+    D --> E[固定 Cypher：指标详情 / PI和II关系 / 无关系理由]
+    E --> F[返回事实及完整证据，生成引用编号]
+    F --> G{LLM 判断是否需补查}
+    G -->|需要，最多补查一轮| E
+    G -->|足够或达到两轮| H[LLM 基于图谱事实生成回答]
+    H -. token 增量预览 .-> V[Vue 回答中：引用待核对]
+    H --> I[核对事实 ID、引用归属、推断标记]
+    I --> J[Vue 展示回答、证据卡片和工具调用记录]
+```
+
+这是 Agentic Graph-RAG：模型根据问题选择工具，可依缺口补查，最终生成回答。并非向量检索，也不是让模型直接执行任意 Cypher。每次问题独立处理，不将前面聊天记录作为上下文；后续问题请写明指标名称。前端保留本页会话，刷新后清空。
+
+三个工具：
+
+- indicator_details：指标名称、定义、发现证据。
+- relations：关联指定指标的入边和出边，可按 PI/II 类型筛选；保留实际起点、终点与条件摘要。
+- no_relation：无有效 PI 判定的原因及证据。
+
+每轮最多 3 次工具调用，最多 2 轮；避免重复调用；每次查询最多 40 条，超过上限时返回覆盖警告。选定论文的指标目录最多 500 条，论文选择列表最多 200 篇。证据上下文约 65,000 字符，按完整记录纳入，超限不截断原句而省略整条并给出警告。以上限制意味着宽泛问题的回答可能不完整，宜按指标细化问题。
+
+回答由 claims 构成，每条都引用检索事实和证据编号。后端确认引用存在、属于指定事实且每条引用事实都有对应证据；任何引用的事实是 inferred，则回答也标记推断。证据不足不会凭空补答案。部分图谱记录没有原文证据时，引用明确标记为图谱属性记录，不冒充论文原句。本轮未调用视觉模型，视觉卡片展示的是抽取阶段已有 observation，可点击查看原图。
+
+引用核对只能保证来源关联，不能自动证明模型解释的语义正确。正文由 Vue 文本插值渲染，不执行模型生成的 HTML；本地 source_file 仅展示，不提供任意文件读取接口。
+
+### 接口
+
+- `GET /api/health`：数据库连通性、模型是否已配置（不等于模型服务可用）。
+- `GET /api/papers`：已导入论文列表和是否截断。
+- `POST /api/chat`：发送 `{ "paper_id": "paper-001", "question": "本文提出了哪些指标？" }`。
+
+响应为 `text/event-stream`，通过 POST fetch 读取。事件格式：
+
+```text
+event: status
+data: {"stage":"thinking","label":"思考中","detail":"识别指标与选择检索工具"}
+
+```
+
+| 事件 | 含义 |
+|---|---|
+| meta | 本次 request_id |
+| status | 读取论文、思考、查询图谱、复核补查、回答、核对引用等实际执行阶段 |
+| plan | 简短检索目的与工具计划，不是模型内部思维链 |
+| tool_start / tool_end | 工具、轮次、返回数量及是否截断 |
+| sources | 累计证据和来源，可在回答生成前查看 |
+| draft | 从模型真实 token 流增量解析的回答文字预览，尚未完成引用校验 |
+| done | 完整且通过引用归属检查的结构化回答，替换预览 |
+| error | 请求中途失败，前端清除未完成预览并保留失败轨迹 |
+
+思考阶段不转发供应商 reasoning_content。回答不是预先生成后模拟打字：后端读取供应商 token 流，经 LangGraph custom 事件和 SSE 逐步发送；前端对 UTF-8 和事件边界进行增量解码。draft 暂不展示尚未验证的引用或“原文明示”标记。done 包含 paper、answer、facts、sources、trace、warnings；request_id 来自 meta。answer 包含 status（answered/insufficient/clarification）、claims、limitation、follow_up，每条 claim 包含 text、assertion_mode、fact_ids、citation_ids。
+
+请求开始前可返回 422（参数错误）、429（并发超过两个）或 503（配置未就绪）。流建立后，数据库、论文不存在、模型或校验异常都通过 error 事件发送，不能再改变 HTTP 状态。前端将缺少 done 的连接终止视为失败，不把部分回答当作成功。
+
+支持“停止生成”：前端中止 fetch，后端收到断连后停止后续工具与模型调用，并在模型下一个流片段或超时处关闭流。已发出的请求不能保证立即取消供应商计算或计费；并发名额在工作线程实际结束后释放。后端有界事件队列避免慢客户端造成无限缓存，并发送心跳；反向代理应关闭 SSE 响应缓冲并设置足够长的读取超时。前端等待上限六分钟，单次模型超时由 QA_MODEL_TIMEOUT 控制。
+
+### 检查
+
+遵循项目约定，不新增测试代码。使用导入检查、OpenAPI 检查、前端生产构建和真实服务读取/问答验证。没有公式、局限性专用数据和跨论文实体归并时，不承诺完整回答这些问题。

@@ -19,3 +19,8 @@ outputs/
 neo4j/
 
 .DS_Store
+
+# Vue development dependencies
+node_modules/
+
+.pnpm-store/
