@@ -12,14 +12,14 @@ def tracing_enabled() -> bool:
 def validate_tracing():
     if tracing_enabled() and not os.getenv("LANGSMITH_API_KEY"):
         raise ValueError("LANGSMITH_TRACING=true 时必须配置 LANGSMITH_API_KEY")
-    os.environ.setdefault("LANGSMITH_PROJECT", "scimetrics")
+    os.environ.setdefault("LANGSMITH_PROJECT", "ie")
 
 
 def instrument_client(client):
     validate_tracing()
     if tracing_enabled():
         return wrap_openai(client, chat_name="DeepSeek", tracing_extra={
-            "metadata": {"ls_provider": "deepseek"}, "tags": ["scimetrics", "deepseek"]})
+            "metadata": {"ls_provider": "deepseek"}, "tags": ["ie", "deepseek"]})
     return client
 
 

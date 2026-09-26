@@ -15,15 +15,17 @@ dependencies = [
     "markdown-it-py>=3,<5",
     "python-dotenv>=1,<2",
     "langsmith>=0.12,<1",
+    "neo4j>=5.26,<7",
 ]
 
 [project.scripts]
-scimetrics = "scimetrics.cli:main"
+ie = "ie.cli:main"
+neo4j-import = "graph_db.neo4j_import:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/scimetrics"]
+packages = ["src/ie", "src/graph_db"]
 

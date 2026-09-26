@@ -16,3 +16,6 @@ data/
 outputs/
 
 .debug/
+neo4j/
+
+.DS_Store

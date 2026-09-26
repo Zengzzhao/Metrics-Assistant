@@ -4,6 +4,7 @@ CONFIG ?= run.toml
 
 .PHONY: help install run start inspect resume continue replay
 help:
+	@echo 'Neo4j 入库：make neo4j-import RESULT=outputs/result.json SOURCE=data/paper.md PAPER_ID=paper-001'
 	@echo '先修改 run.toml 与 .env，再使用 make run/start/inspect/resume/continue/replay'
 install:
 	$(UV) sync
@@ -13,4 +14,12 @@ install:
 # make continue # 执行剩余全部节点
 # make run       # 完整运行
 run start inspect resume continue replay:
-	$(UV) run scimetrics --config "$(CONFIG)" --action $@
+	$(UV) run ie --config "$(CONFIG)" --action $@
+
+# make neo4j-import RESULT=outputs/result.json SOURCE="data/paper.md" PAPER_ID=paper-001
+RESULT ?= outputs/result.json
+SOURCE ?=
+PAPER_ID ?=
+.PHONY: neo4j-import
+neo4j-import:
+	$(UV) run neo4j-import --result "$(RESULT)" --source "$(SOURCE)" $(if $(PAPER_ID),--paper-id "$(PAPER_ID)")

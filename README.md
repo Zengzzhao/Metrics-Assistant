@@ -2,7 +2,7 @@
 
 从论文 Markdown 发现具名科学计量指标，完成文内归并，抽取论文—指标（PI）及指标—指标（II）关系。使用 DeepSeek、LangGraph、SQLite checkpoint，可选 LangSmith 追踪。
 
-当前不执行 PDF/MinerU 解析、跨论文归并或 Neo4j 入库，也没有独立的公式、局限性抽取模块。结果标记为 `extracted_unverified`：来源定位通过不代表语义判断已验证。
+抽取流程不执行 PDF/MinerU 解析或跨论文归并，也没有独立的公式、局限性抽取模块。Neo4j 入库由独立的 `graph_db` 模块完成。结果标记为 `extracted_unverified`：来源定位通过不代表语义判断已验证。
 
 ## 项目结构
 
@@ -14,7 +14,7 @@ project/
 ├── run.toml                    # 运行参数
 ├── .env.example                # 密钥、服务地址及追踪配置示例
 ├── data/                       # 已解析的 Markdown
-├── src/scimetrics/
+├── src/ie/
 │   ├── __init__.py
 │   ├── cli.py                  # 配置、运行、恢复、历史重放
 │   ├── pipeline.py             # State、节点及图编排
@@ -27,6 +27,9 @@ project/
 │       ├── merge.py            # 归并结构及引用校验
 │       ├── client.py           # DeepSeek JSON 调用
 │       └── observability.py    # LangSmith 追踪
+├── src/graph_db/               # Neo4j 数据转换与事务导入
+│   ├── __init__.py
+│   └── neo4j_import.py
 ├── outputs/                    # run.toml 指定的输出目录
 └── .debug/
     ├── checkpoints.sqlite      # 检查点历史与任务配置
@@ -206,7 +209,7 @@ field = "all"
 
 ```bash
 make resume CONFIG=another.toml
-uv run scimetrics --config run.toml --action inspect
+uv run ie --config run.toml --action inspect
 ```
 
 CLI 仅接受 `--config`、`--action` 和帮助选项。Make 的动作覆盖 TOML 的 action。
@@ -255,3 +258,91 @@ start 固定保存输入、输出、模型及输入文件哈希。resume/replay 
 `.env.example` 列出 DEEPSEEK_API_KEY、DEEPSEEK_BASE_URL、LANGSMITH_TRACING、LANGSMITH_API_KEY、LANGSMITH_PROJECT、LANGSMITH_ENDPOINT。开启 LangSmith 后，模型输入、输出和图片 URL 等会上传追踪服务；LangSmith 用于诊断，SQLite 用于恢复，两者不能互相替代。
 
 提示词按“总纲＋字段填写规则”组织。项目不新增测试文件或测试代码，修改使用语法、导入、配置、图构建及必要的实际数据检查验证；未调用模型的检查不代表已验证抽取准确率。
+
+## 单篇论文导入 Neo4j
+
+抽取包已由 `src/scimetrics` 改名为 `src/ie`（information extraction），命令入口为 `ie`；原有 `make run/start/inspect/resume/continue/replay` 用法不变。执行 `uv sync` 更新依赖和入口。现有 JSON 与 checkpoint 不做迁移或清空。
+
+新增目录：
+
+```text
+src/graph_db/
+├── __init__.py
+└── neo4j_import.py
+```
+
+该模块独立读取最终 `result.json`，不调用抽取模型，也不实现问答。使用 `graph_db` 包名避免与官方 `neo4j` 驱动重名。
+
+先启动 Neo4j 数据库，并在 `.env` 配置 `NEO4J_URI`、`NEO4J_USER`、`NEO4J_PASSWORD`、`NEO4J_DATABASE`（参考 `.env.example`）。导入账户需要写入和建立唯一约束的权限。
+
+先做本地转换检查，不连接数据库：
+
+```bash
+uv run neo4j-import --result outputs/result.json --source "data/paper.md" \
+  --paper-id paper-001 --dry-run --payload-output outputs/graph-payload.json
+```
+
+将 `data/paper.md` 替换为实际抽取使用的 Markdown。正式导入：
+
+```bash
+uv run neo4j-import --result outputs/result.json --source "data/paper.md" --paper-id paper-001
+# 等价 Make 命令
+make neo4j-import RESULT=outputs/result.json SOURCE="data/paper.md" PAPER_ID=paper-001
+```
+
+`--title` 可指定标题，默认读取 Markdown 第一个一级标题。建议显式指定稳定的 `--paper-id`；省略时使用 Markdown 内容 SHA256，修改 Markdown 会被视为新论文。文件 SHA256、结果 SHA256 和源路径保存在 Paper 节点。已有证据的 source_spans 会与所提供的原文核对，但导入不会重新验证抽取的语义真实性。
+
+图谱模型只有两类节点：
+
+- `Paper`：论文元数据、抽取状态，以及序列化的章节、过滤章节、归并记录。
+- `Indicator`：论文命名空间内的指标，保存名称、别名、定义、来源章节和指标发现证据。
+
+PI 直接写为 `Paper -[:PROPOSES|MODIFIES|APPLIES]-> Indicator`（每个指标最多一类有效 PI）。II 直接写为指标间的 VARIANT_OF、DERIVED_FROM、IMPROVES_ON、ALTERNATIVE_TO、COMPONENT_OF 边，支持同一对指标的不同关系。ALTERNATIVE_TO 按指标清单顺序保存一次，语义上为对称关系，查询时可忽略箭头方向。
+
+每条业务关系保存：
+
+| 属性 | 内容 |
+|---|---|
+| relation_id | 由论文、端点和关系类型生成的稳定 ID |
+| paper_id / importer | 来源论文和导入器 |
+| assertion_mode | explicit 或 inferred |
+| rationale_summary | 判断依据摘要及适用条件 |
+| evidence_json | 完整证据数组的 JSON 字符串，包含观察描述、原句和来源位置 |
+| evidence_quotes | 引句或图片链接的字符串数组，方便展示 |
+| evidence_count | 该关系证据条数 |
+| status | 保留抽取结果状态，入库不代表语义验证通过 |
+
+证据顺序与原结果一致，保留依据摘要中的证据下标。视觉证据的 quote 是图片 URL，observation 保存在 evidence_json 中。Neo4j 属性不能直接保存嵌套对象数组，因此完整证据序列化保存，不再生成 Assertion、Evidence 节点。指标发现证据保存为 Indicator 的同名 evidence_* 属性，与关系证据分别维护。
+
+每篇论文仍通过辅助 `MENTIONS` 连接全部指标。仅无有效 PI 的 MENTIONS 保存 no_relation_reason、no_relation_detail、rationale_summary 和 evidence_*；有效 PI 的证据只写在实际业务关系上。展示主图时可隐藏 MENTIONS。
+
+重复导入相同 paper_id，会在单个事务内删除该导入器拥有的旧指标及关联边并重建。也会清理该论文旧版 Assertion/Evidence 节点；其他论文和其他导入器数据不受影响。不会自动删除数据库级旧约束，避免影响其他尚未重导入的论文。自动生成节点上的人工附加关系会随删除重建丢失，请另行保存人工标注。唯一约束单独建立；数据事务失败会回滚，保留此前图谱。
+
+成功输出论文、指标、MENTIONS、PI/II、无关系记录数量；evidence_entries 是所有节点和关系属性内的证据条目总数，同一证据被多处引用时分别计数。`--dry-run` 不连接数据库，不代表写入成功。
+
+查看论文的业务关系（隐藏 MENTIONS）：
+
+```cypher
+MATCH (s)-[r]->(o)
+WHERE r.paper_id = 'paper-001' AND r.importer = 'ie_import'
+  AND type(r) <> 'MENTIONS'
+RETURN s, r, o
+```
+
+查看本文提出的指标及证据：
+
+```cypher
+MATCH (p:Paper {id: 'paper-001'})-[r:PROPOSES]->(i:Indicator)
+RETURN i.name, r.relation_id, r.assertion_mode, r.rationale_summary,
+       r.evidence_quotes, r.evidence_json
+```
+
+查询没有有效 PI 关系的指标及原因：
+
+```cypher
+MATCH (p:Paper {id: 'paper-001'})-[m:MENTIONS]->(i:Indicator)
+WHERE m.no_relation_reason IS NOT NULL
+RETURN i.name, m.no_relation_reason, m.no_relation_detail, m.evidence_quotes
+```
+
+前端悬浮关系时可显示 type(r)、assertion_mode 和 evidence_quotes；点击详情时解析 evidence_json，展示全部引句、视觉观察及来源位置。稳定定位使用 relation_id。当前仅实现数据存储，尚未实现前端悬浮事件或问答界面；Neo4j Browser 不会因属性存在就自动生成定制的悬浮框。

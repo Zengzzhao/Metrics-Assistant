@@ -91,7 +91,7 @@ def execute(graph, initial, name, thread_id=None, checkpoint_config=None):
     config = {
         "run_id": uuid4(),
         "run_name": name,
-        "tags": ["scimetrics"],
+        "tags": ["ie"],
         # 每章占一个图执行步；循环仍由有限的章节清单决定结束。
         "recursion_limit": 10000,
     }
