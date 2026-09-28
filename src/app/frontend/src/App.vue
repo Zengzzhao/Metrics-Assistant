@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { api, streamChat } from './api'
+import MarkdownContent from './components/MarkdownContent.vue'
+import PaperPicker from './components/PaperPicker.vue'
 import type { Paper, Result, SourceBundle, Turn, ToolName, AssertionMode } from './types'
 
 const papers = ref<Paper[]>([]), paperId = ref(''), question = ref(''), turns = ref<Turn[]>([])
@@ -32,11 +34,13 @@ async function ask() {
   if (busy.value || !question.value.trim() || !paperId.value) return
   const text = question.value.trim(), id = paperId.value
   const title = selectedPaper.value?.title || id
+  const history = turns.value.filter(t => t.paperId === id && t.data && !t.error)
+    .slice(-12).map(t => ({ question: t.question, answer: t.data!.answer }))
   busy.value = true; error.value = ''; elapsed.value = 0
   timer = setInterval(() => elapsed.value++, 1000)
   controller = new AbortController()
   const timeout = setTimeout(() => controller?.abort(), 360000)
-  const turn: Turn = { question: text, title, data: null, error: '', status: '连接中',
+  const turn: Turn = { question: text, title, paperId: id, data: null, error: '', status: '连接中',
     progress: [], draft: null, requestId: '', finished: false }
   turns.value.push(turn)
   const index = turns.value.length - 1
@@ -44,7 +48,7 @@ async function ask() {
   await nextTick(); resultsEl.value?.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   try {
     const current = turns.value[index]!
-    await streamChat({ question: text, paper_id: id }, controller.signal, (event) => {
+    await streamChat({ question: text, paper_id: id, history }, controller.signal, (event) => {
       switch (event.event) {
         case 'meta': current.requestId = event.data.request_id; break
         case 'status':
@@ -91,6 +95,7 @@ function safeUrl(value: string) {
   try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) ? url.href : null } catch { return null }
 }
 function reset() { turns.value = []; active.value = null; activeCitation.value = ''; error.value = '' }
+watch(paperId, reset, { flush: 'sync' })
 onMounted(load)
 onBeforeUnmount(() => { clearInterval(timer); controller?.abort() })
 </script>
@@ -106,29 +111,29 @@ onBeforeUnmount(() => { clearInterval(timer); controller?.abort() })
       <section class="workspace">
         <div class="chat-column">
           <div class="scope-card">
-            <label for="paper">检索范围 <span>单篇论文</span></label>
-            <div class="scope-controls"><select id="paper" v-model="paperId" :disabled="busy || booting || !papers.length"><option v-if="!papers.length" value="">暂无论文，请先导入 Neo4j</option><option v-for="p in papers" :key="p.id" :value="p.id">{{ p.title }} · {{ p.id }}</option></select><button class="icon-button" :disabled="busy || booting" @click="load" aria-label="刷新连接和论文列表">↻</button></div>
-            <p class="scope-note">每次提问独立检索当前论文；提及具体指标时请填写名称。</p>
+            <label id="paper-label" for="paper">检索范围 <span>单篇论文</span></label>
+            <div class="scope-controls"><PaperPicker v-model="paperId" :papers="papers" :disabled="busy || booting || !papers.length" /><button class="icon-button" :disabled="busy || booting" @click="load" aria-label="刷新连接和论文列表">↻</button></div>
+            <p class="scope-note">支持结合当前论文最近 12 轮已完成问答继续追问；切换论文、清空会话或刷新页面会重置上下文。</p>
           </div>
           <p v-if="error" role="alert" class="error">{{ error }}</p>
           <div v-if="!turns.length" class="empty-state"><div class="orbit">◎</div><h2>从一个问题开始</h2><p>Agent 将选择检索工具，查询图谱关系与证据，再生成回答。</p><div class="examples"><button v-for="example in examples" :key="example" @click="question = example">{{ example }} <span>↗</span></button></div></div>
           <div ref="resultsEl" class="turns" aria-live="polite">
             <article v-for="(turn, index) in turns" :key="index" class="turn">
-              <div class="question"><span>你的问题</span><h2>{{ turn.question }}</h2><small>{{ turn.title }}</small></div>
+              <div class="question"><span>你的问题</span><MarkdownContent class="question-text" :source="turn.question" /><MarkdownContent class="question-title" :source="turn.title" /></div>
               <details class="live-trace" :open="!turn.finished">
                 <summary><span :class="{ spinner: !turn.finished }" />{{ turn.status }}<small v-if="!turn.finished">{{ elapsed }}s</small></summary>
-                <ol><li v-for="(step, n) in turn.progress" :key="n"><span>{{ step.seconds }}s</span><div><strong>{{ step.label }}</strong><p>{{ step.detail }}</p></div></li></ol>
+                <ol><li v-for="(step, n) in turn.progress" :key="n"><span>{{ step.seconds }}s</span><div><strong>{{ step.label }}</strong><MarkdownContent :source="step.detail" /></div></li></ol>
               </details>
-              <div v-if="turn.draft" class="stream-draft"><span class="badge">正在生成 · 引用待核对</span><p v-for="(text, n) in turn.draft.texts" :key="n">{{ text }}</p><p v-if="turn.draft.limitation">{{ turn.draft.limitation }}</p><p v-if="turn.draft.follow_up">{{ turn.draft.follow_up }}</p></div>
+              <div v-if="turn.draft" class="stream-draft"><span class="badge">正在生成 · 引用待核对</span><MarkdownContent v-for="(text, n) in turn.draft.texts" :key="n" :source="text" /><MarkdownContent v-if="turn.draft.limitation" :source="turn.draft.limitation" /><MarkdownContent v-if="turn.draft.follow_up" :source="turn.draft.follow_up" /></div>
               <div v-if="turn.error" class="error" role="alert">{{ turn.error }}</div>
               <div v-else-if="!turn.data && !turn.draft" class="loading">正在等待当前阶段返回…</div>
               <div v-if="turn.data" class="answer">
                 <div class="answer-heading"><span>图谱回答</span><button class="text-button" @click="active = turn.data; activeCitation = ''">查看依据 ↗</button></div>
-                <div v-for="(claim, n) in turn.data.answer.claims" :key="n" class="claim"><span :class="['badge', claim.assertion_mode]">{{ labels[claim.assertion_mode] }}</span><p>{{ claim.text }}</p><div class="citations"><button v-for="id in claim.citation_ids" :key="id" @click="showCitation(turn.data, id)">[{{ id }}] 证据</button></div></div>
-                <p v-if="turn.data.answer.limitation" class="notice">{{ turn.data.answer.limitation }}</p>
-                <p v-if="turn.data.answer.follow_up" class="followup">{{ turn.data.answer.follow_up }}</p>
-                <p v-for="warning in turn.data.warnings" :key="warning" class="notice">{{ warning }}</p>
-                <details class="trace"><summary>检索过程 · {{ turn.data.trace.length }} 次工具调用</summary><div v-for="(step, n) in turn.data.trace" :key="n"><strong>第 {{ step.round }} 轮 · {{ toolLabels[step.tool] }}</strong><p>{{ step.purpose }}</p><small>{{ step.predicates.join(' / ') || '未限制关系类型' }} · 返回 {{ step.returned }} 条，新增 {{ step.added }} 条</small></div><small class="request-id">请求 ID：{{ turn.data.request_id }}</small></details>
+                <div v-for="(claim, n) in turn.data.answer.claims" :key="n" class="claim"><span :class="['badge', claim.assertion_mode]">{{ labels[claim.assertion_mode] }}</span><MarkdownContent :source="claim.text" /><div class="citations"><button v-for="id in claim.citation_ids" :key="id" @click="showCitation(turn.data, id)">[{{ id }}] 证据</button></div></div>
+                <MarkdownContent v-if="turn.data.answer.limitation" class="notice" :source="turn.data.answer.limitation" />
+                <MarkdownContent v-if="turn.data.answer.follow_up" class="followup" :source="turn.data.answer.follow_up" />
+                <MarkdownContent v-for="warning in turn.data.warnings" :key="warning" class="notice" :source="warning" />
+                <details class="trace"><summary>检索过程 · {{ turn.data.trace.length }} 次工具调用</summary><div v-for="(step, n) in turn.data.trace" :key="n"><strong>第 {{ step.round }} 轮 · {{ toolLabels[step.tool] }}</strong><MarkdownContent :source="step.purpose" /><small>{{ step.predicates.join(' / ') || '未限制关系类型' }} · 返回 {{ step.returned }} 条，新增 {{ step.added }} 条</small></div><small class="request-id">请求 ID：{{ turn.data.request_id }}</small></details>
               </div>
             </article>
           </div>
@@ -137,11 +142,11 @@ onBeforeUnmount(() => { clearInterval(timer); controller?.abort() })
         </div>
         <aside class="evidence-panel"><div class="panel-heading"><div><span class="eyebrow">SOURCE NOTES</span><h2>证据与来源</h2></div><span class="count">{{ sources.length }}</span></div>
           <div v-if="!active" class="evidence-empty"><span>↖</span><p>回答生成后，点击引用编号，<br>在这里查看对应原文与来源。</p></div>
-          <template v-else><p class="paper-caption">{{ active.paper.title }}</p><p v-if="!sources.length" class="evidence-empty">本次没有可展示的证据。</p><div class="source-list"><article v-for="source in sources" :id="`citation-${source.id}`" :key="source.id" :class="['source-card', { selected: source.id === activeCitation }]">
+          <template v-else><MarkdownContent class="paper-caption" :source="active.paper.title" /><p v-if="!sources.length" class="evidence-empty">本次没有可展示的证据。</p><div class="source-list"><article v-for="source in sources" :id="`citation-${source.id}`" :key="source.id" :class="['source-card', { selected: source.id === activeCitation }]">
             <div class="source-heading"><strong>{{ source.id }}</strong><span>{{ source.evidence.kind === 'text' ? '原文证据' : source.evidence.kind === 'visual' ? '已有视觉观察' : '图谱属性记录' }}</span></div>
-            <blockquote v-if="source.evidence.kind === 'text'">{{ source.evidence.quote }}</blockquote>
-            <template v-else-if="source.evidence.kind === 'visual'"><p>{{ source.evidence.observation }}</p><a v-if="safeUrl(source.evidence.quote)" :href="safeUrl(source.evidence.quote) || undefined" target="_blank" rel="noopener noreferrer">打开原图 ↗</a><small v-else>{{ source.evidence.quote }}</small></template>
-            <p v-else>{{ source.evidence.observation }}</p>
+            <blockquote v-if="source.evidence.kind === 'text'"><MarkdownContent :source="source.evidence.quote" /></blockquote>
+            <template v-else-if="source.evidence.kind === 'visual'"><MarkdownContent :source="source.evidence.observation" /><a v-if="safeUrl(source.evidence.quote)" :href="safeUrl(source.evidence.quote) || undefined" target="_blank" rel="noopener noreferrer">打开原图 ↗</a><small v-else>{{ source.evidence.quote }}</small></template>
+            <MarkdownContent v-else :source="source.evidence.observation" />
             <details><summary>溯源信息</summary><dl><dt>论文</dt><dd>{{ source.paper_id }}</dd><dt>事实 ID</dt><dd>{{ source.fact_id }}</dd><template v-if="source.evidence.source_file"><dt>原始文件</dt><dd>{{ source.evidence.source_file }}</dd></template><template v-if="source.evidence.source_spans?.length"><dt>字符位置（从 0 起）</dt><dd v-for="(span, n) in source.evidence.source_spans" :key="n">[{{ span.start }}, {{ span.end }})</dd></template><template v-else-if="source.evidence.source_start != null"><dt>字符位置</dt><dd>[{{ source.evidence.source_start }}, {{ source.evidence.source_end }})</dd></template></dl></details>
           </article></div></template>
         </aside>

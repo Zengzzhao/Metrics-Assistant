@@ -14,7 +14,8 @@ export interface Trace { round: number; tool: ToolName; indicator_ids: string[];
 export interface Result extends SourceBundle { request_id: string; answer: Answer; facts: Record<string, unknown>[]; trace: Trace[]; warnings: string[] }
 export interface Draft { texts: string[]; limitation: string; follow_up: string | null }
 export interface Progress { label: string; detail: string; seconds: number }
-export interface Turn { question: string; title: string; data: Result | null; error: string; status: string; progress: Progress[]; draft: Draft | null; requestId: string; finished: boolean }
+export interface HistoryTurn { question: string; answer: Answer }
+export interface Turn { paperId: string; question: string; title: string; data: Result | null; error: string; status: string; progress: Progress[]; draft: Draft | null; requestId: string; finished: boolean }
 export type StreamEvent =
   | { event: 'meta'; data: { request_id: string } }
   | { event: 'status'; data: { stage: string; label: string; detail: string } }

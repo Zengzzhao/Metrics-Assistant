@@ -6,11 +6,6 @@ class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ChatRequest(Strict):
-    question: str = Field(min_length=1, max_length=2000)
-    paper_id: str = Field(min_length=1, max_length=300)
-
-
 Predicate = Literal["PROPOSES", "MODIFIES", "APPLIES", "VARIANT_OF", "DERIVED_FROM",
                     "IMPROVES_ON", "ALTERNATIVE_TO", "COMPONENT_OF"]
 
@@ -39,3 +34,14 @@ class Answer(Strict):
     claims: list[Claim] = Field(default_factory=list, max_length=30)
     limitation: str = Field(default="", max_length=1500)
     follow_up: str | None = Field(default=None, max_length=500)
+
+
+class HistoryTurn(Strict):
+    question: str = Field(min_length=1, max_length=2000)
+    answer: Answer
+
+
+class ChatRequest(Strict):
+    question: str = Field(min_length=1, max_length=2000)
+    paper_id: str = Field(min_length=1, max_length=300)
+    history: list[HistoryTurn] = Field(default_factory=list, max_length=12)

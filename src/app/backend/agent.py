@@ -24,6 +24,7 @@ def emit(event, **data):
 
 class State(TypedDict, total=False):
     question: str
+    history: list
     paper: dict
     catalog: list
     plan: dict
@@ -102,11 +103,11 @@ class KnowledgeAgent:
                              f'max_tokens={self.max_tokens}。可缩小问题范围或调整 QA_MAX_OUTPUT_TOKENS。')
         return schema.model_validate_json(content)
 
-    def _plan(self, state, review=False):
+    def plan(self, state, *, review=False):
         emit('status', stage='review' if review else 'thinking',
              label='检查证据与规划补查中' if review else '思考中',
              detail='判断是否需要补充检索' if review else '识别指标与选择检索工具')
-        data = {k: state[k] for k in ('question', 'paper', 'catalog')}
+        data = {k: state[k] for k in ('question', 'history', 'paper', 'catalog')}
         if review:
             # 复核依据已取回的真实内容，决定是否仍需调用工具。
             data.update({k:state[k] for k in ('facts','sources','trace','warnings')})
@@ -123,11 +124,8 @@ class KnowledgeAgent:
         emit('plan', **result.model_dump())
         return {'plan':result.model_dump()}
 
-    def plan(self, state):
-        return self._plan(state)
-
     def review(self, state):
-        return self._plan(state, review=True)
+        return self.plan(state, review=True)
 
     @staticmethod
     def after_plan(state):
@@ -194,7 +192,7 @@ class KnowledgeAgent:
             result = Answer(status='insufficient', limitation='当前论文图谱未检索到支持该问题的资料；这不代表相关指标或关系在现实中不存在。',
                             follow_up='可以指定指标的原文名称，或换一个关系类型继续查询。')
         else:
-            result = self.call(prompts.GENERATE, {k:state[k] for k in ('question','paper','facts','sources','warnings')}, Answer)
+            result = self.call(prompts.GENERATE, {k:state[k] for k in ('question','history','paper','facts','sources','warnings')}, Answer)
             emit('status', stage='validating', label='核对引用中', detail='检查事实与证据归属')
             facts = {f['id']:f for f in state['facts']}
             sources = {s['id']:s for s in state['sources']}
@@ -218,7 +216,7 @@ class KnowledgeAgent:
                 result.limitation = result.limitation or '现有证据不足以形成可引用的回答。'
         return {'answer':result.model_dump()}
 
-    def stream(self, question, paper_id, cancelled: Event):
+    def stream(self, question, paper_id, cancelled: Event, *, history=()):
         yield {'event':'status', 'data':{'stage':'catalog','label':'读取论文中','detail':'加载指标目录'}}
         paper, catalog, truncated = self.store.catalog(paper_id)
         if cancelled.is_set():
@@ -229,14 +227,31 @@ class KnowledgeAgent:
             return
         catalog = [{**i, 'aliases':(i['aliases'] or [])[:10]} for i in catalog]
         warnings = ['指标目录超过 500 条，仅提供前 500 条，实体匹配范围受限。'] if truncated else []
-        state = dict(question=question, paper=paper, catalog=catalog, facts=[], sources=[],
+
+        # 限制历史上下文长度，同时优先保留最近完整的问答，并避免旧引用编号污染当前请求。
+        conversation, history_chars = [], 0
+        for turn in reversed(history):
+            item = dict(question=turn.question, answer=turn.answer.model_dump(
+                exclude={'claims': {'__all__': {'fact_ids', 'citation_ids'}}}))
+            cost = len(json.dumps(item, ensure_ascii=False))
+            # 最长保留 24k 字符的历史上下文，超过则丢弃较早的问答。
+            if history_chars + cost > 24_000:
+                warnings.append('会话上下文达到长度上限，仅使用最近可完整容纳的问答；较早内容请在问题中补充。')
+                break
+            conversation.insert(0, item)
+            history_chars += cost
+        
+        state = dict(question=question, history=conversation, paper=paper, catalog=catalog, facts=[], sources=[],
                      trace=[], warnings=warnings, seen_calls=[], rounds=0)
         for mode, update in self.graph.stream(state,
                 {'recursion_limit':12, 'configurable':{'_cancel':cancelled}}, stream_mode=['custom','updates']):
+            # LangGraph 同时给两种输出。stream_mode=['custom', 'updates']
             if cancelled.is_set():
                 return
+            # custom：自己主动emit的事件，给UI/用户看的实时事件。
             if mode == 'custom':
                 yield update
+            # updates：LangGraph 节点执行结束以后，节点返回了哪些 state 更新，将更新应用到局部state中，供最终回答使用
             else:
                 for values in update.values():
                     state.update(values)

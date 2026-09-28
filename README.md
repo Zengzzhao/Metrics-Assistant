@@ -454,6 +454,7 @@ flowchart TD
 
 | State 字段 | 内容 |
 | --- | --- |
+| history | 同一论文已完成问答，供规划、补查与回答理解指代；不作为事实证据 |
 | question、paper、catalog | 用户问题、选定论文、用于名称/别名匹配的指标目录 |
 | plan | explanation、clarification、calls；工具调用只能引用目录中的指标 ID |
 | facts | 工具取回的事实，包含稳定 ID 与 citation_ids |
@@ -468,7 +469,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Vue：论文 ID 与用户问题] --> B[POST /api/chat]
+    A[Vue：论文 ID、当前问题与历史问答] --> B[POST /api/chat]
     B --> C[加载所选论文和指标目录]
     B -. SSE 阶段事件 .-> U[Vue 实时执行轨迹]
     C --> D[LLM 规划：选择检索工具及参数]
@@ -482,7 +483,9 @@ flowchart TD
     I --> J[Vue 展示回答、证据卡片和工具调用记录]
 ```
 
-这是 Agentic Graph-RAG：模型根据问题选择工具，可依缺口补查，最终生成回答。并非向量检索，也不是让模型直接执行任意 Cypher。每次问题独立处理，不将前面聊天记录作为上下文；后续问题请写明指标名称。前端保留本页会话，刷新后清空。
+这是 Agentic Graph-RAG：模型根据问题选择工具，可依缺口补查，最终生成回答。并非向量检索，也不是让模型直接执行任意 Cypher。支持多轮追问：前端携带当前论文最近 12 轮已完成问答，后端按 24,000 字符预算保留最近可完整容纳的历史，超限会提示。历史问题、正式回答及澄清内容用于理解指代，历史事实与证据编号不直接复用；本轮仍重新检索并核验引用。失败或取消的草稿不进入历史。切换论文、清空会话或刷新页面会重置上下文，服务端不持久化聊天。
+
+流式草稿、正式回答、证据原文、视觉观察、问题和检索说明统一使用 [vue-markdown-renderer](https://github.com/linzhe141/vue-markdown-renderer) 的 npm 包 `vue-mdr` 渲染，配合 remark-math 与 KaTeX 显示 `$...$` / `$$...$$` 公式，并支持列表、表格和代码块。原始 HTML 不启用；证据内容仅改变显示方式，溯源位置仍对应原文。
 
 三个工具：
 
@@ -494,13 +497,13 @@ flowchart TD
 
 回答由 claims 构成，每条都引用检索事实和证据编号。后端确认引用存在、属于指定事实且每条引用事实都有对应证据；任何引用的事实是 inferred，则回答也标记推断。证据不足不会凭空补答案。部分图谱记录没有原文证据时，引用明确标记为图谱属性记录，不冒充论文原句。本轮未调用视觉模型，视觉卡片展示的是抽取阶段已有 observation，可点击查看原图。
 
-引用核对只能保证来源关联，不能自动证明模型解释的语义正确。正文由 Vue 文本插值渲染，不执行模型生成的 HTML；本地 source_file 仅展示，不提供任意文件读取接口。
+引用核对只能保证来源关联，不能自动证明模型解释的语义正确。正文统一通过 Markdown 组件渲染，关闭原始 HTML 并保留内容清理；本地 source_file 仅展示，不提供任意文件读取接口。
 
 ### 接口
 
 - `GET /api/health`：数据库连通性、模型是否已配置（不等于模型服务可用）。
 - `GET /api/papers`：已导入论文列表和是否截断。
-- `POST /api/chat`：发送 `{ "paper_id": "paper-001", "question": "本文提出了哪些指标？" }`。
+- `POST /api/chat`：发送 `{ "paper_id": "paper-001", "question": "本文提出了哪些指标？", "history": [] }`。`history` 可省略；后续请求按时间顺序附带最多 12 个 `{question, answer}`，其中 `answer` 是之前 `done` 事件中的正式回答。
 
 响应为 `text/event-stream`，通过 POST fetch 读取。事件格式：
 

@@ -1,4 +1,4 @@
-import type { StreamEvent } from './types'
+import type { StreamEvent, HistoryTurn } from './types'
 
 async function checked(response: Response): Promise<Response> {
   if (!response.ok) {
@@ -12,7 +12,7 @@ export async function api<T>(path: string): Promise<T> {
 }
 
 /** 增量解码 UTF-8 与 SSE 分帧，不能将一次网络分块当作一条事件。 */
-export async function streamChat(body: { question: string; paper_id: string }, signal: AbortSignal,
+export async function streamChat(body: { question: string; paper_id: string; history: HistoryTurn[] }, signal: AbortSignal,
   receive: (event: StreamEvent) => void): Promise<void> {
   const response = await checked(await fetch('/api/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
