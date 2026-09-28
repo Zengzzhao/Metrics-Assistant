@@ -424,6 +424,14 @@ make qa-frontend
 
 Vite 代理 `/api` 到后端，无需开放跨域。后端地址不同时，启动前端前设置 QA_BACKEND_URL。生产构建运行 `make qa-build`，产物位于 src/app/frontend/dist；生产部署应配置同源 `/api` 反向代理。`pnpm --dir src/app/frontend run preview` 可本地预览构建，preview 同样配置代理。
 
+### 问答 LangSmith 追踪
+
+问答沿用 IE 的 `LANGSMITH_TRACING`、`LANGSMITH_API_KEY`、`LANGSMITH_PROJECT` 和 `LANGSMITH_ENDPOINT`。在 `.env` 中设置 `LANGSMITH_TRACING=true` 并配置密钥后重启后端即可启用；关闭时不上传追踪。开启但缺少密钥时，后端启动会明确报错。已配置的项目名保持不变，因此使用示例的 `LANGSMITH_PROJECT=ie` 时，问答也进入该项目，以 `qa` 标签区分；未设置项目名时问答默认使用 `qa`。
+
+进入问答图后，根运行名为 `qa:chat`，运行 ID 与 SSE `meta.request_id`、前端检索过程中的请求 ID 相同。元数据包含 `paper_id`、`model` 和实际保留的历史轮数 `history_turns`。图中可查看 `plan → retrieve → review → answer` 的实际执行路径、节点输入输出、耗时和异常；三阶段模型调用分别命名为 `deepseek:qa:plan`、`deepseek:qa:review`、`deepseek:qa:answer`，附在对应节点下。流式请求开启 usage 返回以记录供应商提供的 token 用量；取消或提前断流时用量可能不完整。
+
+启用后，当前问题、保留的历史问答、指标目录、图谱事实、证据和模型输入输出会上传到配置的 LangSmith 服务。目录读取发生在图外；论文不存在、没有指标等未进入图的请求不会产生 `qa:chat` 运行。服务正常关闭时等待已排队的追踪发送，不在每次问答完成时阻塞 SSE。追踪用于诊断，不增加聊天持久化或 checkpoint。接入方式参考 [LangSmith 的 LangGraph 官方说明](https://docs.langchain.com/langsmith/trace-with-langgraph)。
+
 ### 后端 Agent 架构
 
 编排入口是 `backend/agent.py::KnowledgeAgent`。它是有界的工具调用式 Agent：模型负责选择检索工具与参数、判断是否补查、生成回答；代码限制工具集合、论文范围、调用次数并核对引用。`store.py` 执行固定的参数化只读 Cypher，模型不能执行任意查询。
@@ -432,6 +440,7 @@ Vite 代理 `/api` 到后端，无需开放跨域。后端地址不同时，启�
 | --- | --- | --- |
 | API 与流传输 | `backend/main.py` | FastAPI 生命周期、配置、并发限制、工作线程、有界队列、SSE、取消信号 |
 | Agent 与状态 | `backend/agent.py` | LangGraph 四节点编排、模型 token 流、引用校验 |
+| 可观测性 | `backend/observability.py` | LangSmith 配置校验、OpenAI 兼容客户端包装、关闭时发送追踪 |
 | 工具实现 | `backend/store.py` | 指标详情、关系、无关系理由三个查询模板 |
 | 模型契约 | `backend/prompts.py`、`backend/schemas.py` | 检索计划、工具参数、结构化回答 |
 | 页面与交互 | `frontend/src/App.vue` | 论文选择、提问、阶段轨迹、回答与证据面板 |

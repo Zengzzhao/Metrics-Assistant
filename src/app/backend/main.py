@@ -19,6 +19,7 @@ from openai import APIError
 from .agent import KnowledgeAgent
 from .schemas import ChatRequest
 from .store import GraphStore
+from .observability import validate_tracing, flush_traces
 
 log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[3]
@@ -27,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[3]
 @asynccontextmanager
 async def lifespan(app):
     load_dotenv(ROOT / ".env")
+    validate_tracing()
     app.state.store = None
     app.state.agent = None
     app.state.slots = BoundedSemaphore(2)
@@ -52,6 +54,7 @@ async def lifespan(app):
             app.state.agent.close()
         if app.state.store:
             app.state.store.close()
+        await asyncio.to_thread(flush_traces)
 
 
 app = FastAPI(title="Scientometrics Knowledge QA", version="0.1.0", lifespan=lifespan)
@@ -122,7 +125,8 @@ def chat(body: ChatRequest, request: Request):
     def work():
         try:
             for event in agent.stream(
-                body.question.strip(), body.paper_id, cancelled, history=body.history
+                body.question.strip(), body.paper_id, cancelled,
+                history=body.history, request_id=request_id,
             ):
                 send(event)
         except InterruptedError:

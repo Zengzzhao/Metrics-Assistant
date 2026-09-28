@@ -3,6 +3,7 @@ import json
 from typing import TypedDict
 from time import monotonic
 from threading import Event
+from uuid import UUID, uuid4
 from pydantic_core import from_json
 from langgraph.config import get_stream_writer, get_config
 
@@ -11,6 +12,7 @@ from openai import OpenAI
 
 from . import prompts
 from .schemas import Answer, Plan, ToolCall
+from .observability import instrument_client, tracing_enabled, validate_tracing
 
 CONTEXT_CHARS = 65_000
 
@@ -39,11 +41,13 @@ class State(TypedDict, total=False):
 
 class KnowledgeAgent:
     def __init__(self, store, *, api_key, base_url, model, timeout, max_tokens=12000, thinking="disabled"):
+        validate_tracing()
         self.store = store
         self.model = model
         self.max_tokens = max_tokens
         self.thinking = thinking
-        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
+        self.client = instrument_client(OpenAI(
+            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0))
         graph = StateGraph(State)
         graph.add_node('plan', self.plan)
         graph.add_node('retrieve', self.retrieve)
@@ -59,17 +63,22 @@ class KnowledgeAgent:
     def close(self):
         self.client.close()
 
-    def call(self, prompt, data, schema):
+    def call(self, prompt, data, schema, *, stage):
         content = ''
         reason = 'no_choices'
         last_preview, last_time = None, 0.0
+        extra = {"langsmith_extra": {
+            "name": f"deepseek:qa:{stage}", "run_id": str(uuid4()),
+            "metadata": {"stage": stage},
+        }} if tracing_enabled() else {}
         # 读取供应商真实 token 流；只投递回答字段，绝不投递 reasoning_content。
         with self.client.chat.completions.create(
             model=self.model,
             messages=[{'role':'system', 'content':prompt + '\n输出 JSON Schema：\n' + json.dumps(schema.model_json_schema(), ensure_ascii=False)},
                       {'role':'user', 'content':json.dumps(data, ensure_ascii=False)}],
             response_format={'type':'json_object'}, max_tokens=self.max_tokens, stream=True,
-            extra_body={'thinking': {'type': self.thinking}}) as stream:
+            stream_options={'include_usage': True},
+            extra_body={'thinking': {'type': self.thinking}}, **extra) as stream:
             for chunk in stream:
                 cancel = get_config().get('configurable', {}).get('_cancel')
                 if cancel is not None and cancel.is_set():
@@ -111,7 +120,7 @@ class KnowledgeAgent:
         if review:
             # 复核依据已取回的真实内容，决定是否仍需调用工具。
             data.update({k:state[k] for k in ('facts','sources','trace','warnings')})
-        result = self.call(prompts.PLAN, data, Plan)
+        result = self.call(prompts.PLAN, data, Plan, stage='review' if review else 'plan')
         known = {i['id'] for i in state['catalog']}
         for call in result.calls:
             if not set(call.indicator_ids) <= known:
@@ -192,7 +201,7 @@ class KnowledgeAgent:
             result = Answer(status='insufficient', limitation='当前论文图谱未检索到支持该问题的资料；这不代表相关指标或关系在现实中不存在。',
                             follow_up='可以指定指标的原文名称，或换一个关系类型继续查询。')
         else:
-            result = self.call(prompts.GENERATE, {k:state[k] for k in ('question','history','paper','facts','sources','warnings')}, Answer)
+            result = self.call(prompts.GENERATE, {k:state[k] for k in ('question','history','paper','facts','sources','warnings')}, Answer, stage='answer')
             emit('status', stage='validating', label='核对引用中', detail='检查事实与证据归属')
             facts = {f['id']:f for f in state['facts']}
             sources = {s['id']:s for s in state['sources']}
@@ -216,7 +225,7 @@ class KnowledgeAgent:
                 result.limitation = result.limitation or '现有证据不足以形成可引用的回答。'
         return {'answer':result.model_dump()}
 
-    def stream(self, question, paper_id, cancelled: Event, *, history=()):
+    def stream(self, question, paper_id, cancelled: Event, *, history=(), request_id=None):
         yield {'event':'status', 'data':{'stage':'catalog','label':'读取论文中','detail':'加载指标目录'}}
         paper, catalog, truncated = self.store.catalog(paper_id)
         if cancelled.is_set():
@@ -243,8 +252,14 @@ class KnowledgeAgent:
         
         state = dict(question=question, history=conversation, paper=paper, catalog=catalog, facts=[], sources=[],
                      trace=[], warnings=warnings, seen_calls=[], rounds=0)
-        for mode, update in self.graph.stream(state,
-                {'recursion_limit':12, 'configurable':{'_cancel':cancelled}}, stream_mode=['custom','updates']):
+        run_id = UUID(request_id) if request_id else uuid4()
+        config = {
+            'run_id': run_id, 'run_name': 'qa:chat', 'tags': ['qa'],
+            'metadata': {'request_id': str(run_id), 'paper_id': paper_id,
+                         'model': self.model, 'history_turns': len(conversation)},
+            'recursion_limit': 12, 'configurable': {'_cancel': cancelled},
+        }
+        for mode, update in self.graph.stream(state, config, stream_mode=['custom','updates']):
             # LangGraph 同时给两种输出。stream_mode=['custom', 'updates']
             if cancelled.is_set():
                 return
