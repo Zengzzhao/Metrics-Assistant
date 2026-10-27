@@ -1,4 +1,4 @@
-"""问答 LangSmith 追踪；沿用 IE 的环境变量开关和项目配置。"""
+"""问答 LangSmith 追踪；共用开关和凭据，使用独立的问答项目。"""
 import os
 
 from langchain_core.tracers.langchain import wait_for_all_tracers
@@ -12,7 +12,8 @@ def tracing_enabled() -> bool:
 def validate_tracing():
     if tracing_enabled() and not os.getenv("LANGSMITH_API_KEY"):
         raise ValueError("LANGSMITH_TRACING=true 时必须配置 LANGSMITH_API_KEY")
-    os.environ.setdefault("LANGSMITH_PROJECT", "qa")
+    # LangGraph 与 wrap_openai 均读取标准变量；仅在问答后端进程内设置。
+    os.environ["LANGSMITH_PROJECT"] = os.getenv("QA_LANGSMITH_PROJECT", "").strip() or "qa"
 
 
 def instrument_client(client):

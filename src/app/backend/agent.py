@@ -1,4 +1,4 @@
-"""有界检索 Agent：规划 → 图查询 → 可选补查 → 基于证据生成。"""
+"""有界检索 Agent：规划 → 单轮图查询 → 基于证据生成。"""
 import json
 from typing import TypedDict
 from time import monotonic
@@ -13,8 +13,6 @@ from openai import OpenAI
 from . import prompts
 from .schemas import Answer, Plan, ToolCall
 from .observability import instrument_client, tracing_enabled, validate_tracing
-
-CONTEXT_CHARS = 65_000
 
 
 def emit(event, **data):
@@ -34,8 +32,6 @@ class State(TypedDict, total=False):
     sources: list
     trace: list
     warnings: list
-    seen_calls: list
-    rounds: int
     answer: dict
 
 
@@ -51,12 +47,10 @@ class KnowledgeAgent:
         graph = StateGraph(State)
         graph.add_node('plan', self.plan)
         graph.add_node('retrieve', self.retrieve)
-        graph.add_node('review', self.review)
         graph.add_node('answer', self.answer)
         graph.add_edge(START, 'plan')
         graph.add_conditional_edges('plan', self.after_plan, ['retrieve', 'answer'])
-        graph.add_conditional_edges('retrieve', lambda s: 'review' if s['rounds'] < 2 else 'answer', ['review', 'answer'])
-        graph.add_conditional_edges('review', self.after_plan, ['retrieve', 'answer'])
+        graph.add_edge('retrieve', 'answer')
         graph.add_edge('answer', END)
         self.graph = graph.compile()
 
@@ -102,8 +96,7 @@ class KnowledgeAgent:
                     texts = [c['text'] for c in claims
                              if isinstance(c, dict) and isinstance(c.get('text'), str)]
                     preview = dict(texts=texts,
-                                   limitation=partial.get('limitation') if isinstance(partial.get('limitation'), str) else '',
-                                   follow_up=partial.get('follow_up') if isinstance(partial.get('follow_up'), str) else None)
+                                   message=partial.get('message') if isinstance(partial.get('message'), str) else '')
                     if preview != last_preview:
                         emit('draft', **preview)
                         last_preview, last_time = preview, monotonic()
@@ -112,15 +105,19 @@ class KnowledgeAgent:
                              f'max_tokens={self.max_tokens}。可缩小问题范围或调整 QA_MAX_OUTPUT_TOKENS。')
         return schema.model_validate_json(content)
 
-    def plan(self, state, *, review=False):
-        emit('status', stage='review' if review else 'thinking',
-             label='检查证据与规划补查中' if review else '思考中',
-             detail='判断是否需要补充检索' if review else '识别指标与选择检索工具')
+    def plan(self, state):
+        """单轮规划：根据问题、历史问答和指标目录选择检索工具。"""
+        emit('status', stage='thinking', label='规划中', detail='根据问题、历史问答和指标目录判断问题是否清晰，若清晰则选择检索工具进行检索')
         data = {k: state[k] for k in ('question', 'history', 'paper', 'catalog')}
-        if review:
-            # 复核依据已取回的真实内容，决定是否仍需调用工具。
-            data.update({k:state[k] for k in ('facts','sources','trace','warnings')})
-        result = self.call(prompts.PLAN, data, Plan, stage='review' if review else 'plan')
+        result = self.call(prompts.PLAN, data, Plan, stage='plan')
+        self._validate_plan(result, state)
+        plan = result.model_dump()
+        emit('plan', **plan)
+        return {'plan': plan}
+
+    @staticmethod
+    def _validate_plan(result: Plan, state: State):
+        """校验工具参数，并清除澄清时的调用；允许重复查询。"""
         known = {i['id'] for i in state['catalog']}
         for call in result.calls:
             if not set(call.indicator_ids) <= known:
@@ -129,32 +126,23 @@ class KnowledgeAgent:
                 raise ValueError('模型生成的检索工具参数不合法，请重试')
         if result.clarification:
             result.calls = []
-        result.calls = [c for c in result.calls if c.model_dump_json() not in state['seen_calls']]
-        emit('plan', **result.model_dump())
-        return {'plan':result.model_dump()}
-
-    def review(self, state):
-        return self.plan(state, review=True)
 
     @staticmethod
     def after_plan(state):
+        # 如果有工具且问题清楚不需要澄清，则进入检索阶段；否则直接进入回答阶段。
         return 'retrieve' if state['plan']['calls'] and not state['plan']['clarification'] else 'answer'
 
     def retrieve(self, state):
         facts, sources = list(state['facts']), list(state['sources'])
-        trace, warnings, seen_calls = list(state['trace']), list(state['warnings']), list(state['seen_calls'])
+        # 工具执行记录用于前端展示检索过程。
+        trace, warnings = list(state['trace']), list(state['warnings'])
         known = {f['id'] for f in facts}
-        used_chars = len(json.dumps([facts, sources], ensure_ascii=False))
+        emit('status', stage='retrieving', label='查询知识图谱中', detail='执行规划中的检索工具')
+        # 一次执行计划内的全部调用，不根据中间结果追加查询。
         for item in state['plan']['calls']:
             call = ToolCall.model_validate(item)
-            signature = call.model_dump_json()
-            if signature in seen_calls:
-                continue
-            emit('status', stage='retrieving', label='查询知识图谱中',
-                 detail='补充检索' if state['rounds'] else '首轮检索')
-            emit('tool_start', round=state['rounds']+1, **call.model_dump())
-            rows, truncated = self.store.retrieve(call, state['paper']['id'])
-            seen_calls.append(signature)
+            emit('tool_start', **call.model_dump())
+            rows = self.store.retrieve(call, state['paper']['id'])
             added = 0
             for row in rows:
                 if not row.get('id'):
@@ -164,47 +152,40 @@ class KnowledgeAgent:
                 evidence = row.pop('evidence')
                 row['citation_ids'] = []
                 new_sources = []
-                # 无文字证据时只允许描述图谱记录，不能把它当作论文原文。
-                if not evidence:
-                    evidence = [{'kind':'graph_record', 'quote': '',
-                                 'observation':'该条目来自图谱属性，未附原文证据。'}]
                 for e in evidence:
                     cid = f"E{len(sources) + len(new_sources) + 1}"
                     row['citation_ids'].append(cid)
                     new_sources.append({'id':cid, 'fact_id':row['id'], 'paper_id':state['paper']['id'],
                                         'paper_title':state['paper']['title'], 'evidence':e})
-                cost = len(json.dumps([row, new_sources], ensure_ascii=False))
-                if used_chars + cost > CONTEXT_CHARS:
-                    warnings.append('检索上下文达到长度上限，部分记录未提供，回答不代表完整枚举。')
-                    continue
-                used_chars += cost
                 facts.append(row)
                 sources.extend(new_sources)
                 known.add(row['id'])
                 added += 1
-            if truncated:
-                warnings.append(f'{call.tool} 返回超过 40 条，本轮只取前 40 条，请按具体指标缩小范围。')
-            trace.append({'round':state['rounds']+1, 'tool':call.tool,
+            trace.append({'tool':call.tool,
                           'indicator_ids':call.indicator_ids, 'predicates':call.predicates,
-                          'returned':len(rows), 'added':added, 'truncated':truncated,
+                          'returned':len(rows), 'added':added, 'truncated':False,
                           'purpose':state['plan']['explanation']})
             emit('tool_end', **trace[-1])
             emit('sources', sources=sources, warnings=list(dict.fromkeys(warnings)), paper=state['paper'])
-        return dict(facts=facts, sources=sources, trace=trace, warnings=list(dict.fromkeys(warnings)),
-                    seen_calls=seen_calls, rounds=state['rounds']+1)
+        return dict(facts=facts, sources=sources, trace=trace, warnings=list(dict.fromkeys(warnings)))
 
     def answer(self, state):
         emit('status', stage='answering', label='回答中', detail='正在根据图谱证据生成回答')
+        # 需要用户澄清
         if state['plan']['clarification']:
-            result = Answer(status='clarification', follow_up=state['plan']['clarification'])
-        elif not state['facts']:
-            result = Answer(status='insufficient', limitation='当前论文图谱未检索到支持该问题的资料；这不代表相关指标或关系在现实中不存在。',
-                            follow_up='可以指定指标的原文名称，或换一个关系类型继续查询。')
+            result = Answer(message=state['plan']['clarification'])
+        # 未执行查询时，模型判定当前问题不需要检索，直接回答
+        elif not state['facts'] and not state['trace']:
+            result = Answer(message=state['plan']['explanation'])
+        # 查询完成后统一生成回答；空结果无需核对引用。
         else:
-            result = self.call(prompts.GENERATE, {k:state[k] for k in ('question','history','paper','facts','sources','warnings')}, Answer, stage='answer')
-            emit('status', stage='validating', label='核对引用中', detail='检查事实与证据归属')
+            result = self.call(prompts.GENERATE, {k:state[k] for k in ('question','history','paper','facts','sources','trace','warnings')}, Answer, stage='answer')
+            if not state['facts']:
+                if result.claims or not result.message.strip():
+                    raise ValueError('空查询回答应提供直接结论，不能生成事实引用，请重试')
+                return {'answer': result.model_dump()}
+            emit('status', stage='validating', label='核对证据引用中', detail='检查事实与证据归属')
             facts = {f['id']:f for f in state['facts']}
-            sources = {s['id']:s for s in state['sources']}
             for claim in result.claims:
                 if not set(claim.fact_ids) <= facts.keys():
                     raise ValueError('回答引用了未检索到的事实，已阻止返回，请重试')
@@ -213,45 +194,38 @@ class KnowledgeAgent:
                 if not set(claim.citation_ids) <= allowed:
                     raise ValueError('回答引用了不属于对应事实的证据，已阻止返回，请重试')
                 if any(not set(f['citation_ids']).intersection(claim.citation_ids) for f in used):
-                    raise ValueError('回答包含未提供相应引用的事实，请重试')
+                    raise ValueError('回答包含未提供相应证据的事实，请重试')
+                # 引用了推断事实 → 标记为 inferred
                 if any(f.get('assertion_mode') == 'inferred' for f in used):
                     claim.assertion_mode = 'inferred'
-                elif any(sources[c]['evidence']['kind'] == 'graph_record' for c in claim.citation_ids):
-                    claim.assertion_mode = 'graph_record'
+                # 定义和无关系判定属于图谱记录；有证据不等于作者明示该判定。
                 elif any(f['kind'] != 'relation' for f in used) and claim.assertion_mode == 'explicit':
                     claim.assertion_mode = 'graph_record'
-            if result.status == 'answered' and not result.claims:
-                result.status = 'insufficient'
-                result.limitation = result.limitation or '现有证据不足以形成可引用的回答。'
+            if not result.claims:
+                result.message = result.message
         return {'answer':result.model_dump()}
 
+    # 流式问答入口
     def stream(self, question, paper_id, cancelled: Event, *, history=(), request_id=None):
-        yield {'event':'status', 'data':{'stage':'catalog','label':'读取论文中','detail':'加载指标目录'}}
-        paper, catalog, truncated = self.store.catalog(paper_id)
+        # 加载论文和指标目录
+        yield {'event':'status', 'data':{'stage':'catalog','label':'读取论文中','detail':'读取论文并加载指标目录'}}
+        paper, catalog = self.store.catalog(paper_id)
         if cancelled.is_set():
             return
         if not catalog:
-            yield {'event':'done', 'data':dict(answer=Answer(status='insufficient', limitation='该论文尚无已导入的指标。').model_dump(),
+            yield {'event':'done', 'data':dict(answer=Answer(message='该论文尚无已导入的指标。').model_dump(),
                         sources=[], facts=[], trace=[], warnings=[], paper=paper)}
             return
-        catalog = [{**i, 'aliases':(i['aliases'] or [])[:10]} for i in catalog]
-        warnings = ['指标目录超过 500 条，仅提供前 500 条，实体匹配范围受限。'] if truncated else []
-
-        # 限制历史上下文长度，同时优先保留最近完整的问答，并避免旧引用编号污染当前请求。
-        conversation, history_chars = [], 0
-        for turn in reversed(history):
-            item = dict(question=turn.question, answer=turn.answer.model_dump(
+        catalog = [{**i, 'aliases': i['aliases'] or []} for i in catalog]
+        # 完整保留历史文本，仅移除旧请求局部的事实与引用编号。
+        conversation = [
+            dict(question=turn.question, answer=turn.answer.model_dump(
                 exclude={'claims': {'__all__': {'fact_ids', 'citation_ids'}}}))
-            cost = len(json.dumps(item, ensure_ascii=False))
-            # 最长保留 24k 字符的历史上下文，超过则丢弃较早的问答。
-            if history_chars + cost > 24_000:
-                warnings.append('会话上下文达到长度上限，仅使用最近可完整容纳的问答；较早内容请在问题中补充。')
-                break
-            conversation.insert(0, item)
-            history_chars += cost
-        
+            for turn in history
+        ]
+        # 初始化 LangGraph 状态
         state = dict(question=question, history=conversation, paper=paper, catalog=catalog, facts=[], sources=[],
-                     trace=[], warnings=warnings, seen_calls=[], rounds=0)
+                     trace=[], warnings=[])
         run_id = UUID(request_id) if request_id else uuid4()
         config = {
             'run_id': run_id, 'run_name': 'qa:chat', 'tags': ['qa'],

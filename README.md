@@ -289,7 +289,7 @@ flowchart TD
 `build_payload` 读取论文标题和文件哈希，为指标添加论文命名空间，检查 PI 覆盖、II 端点及关系冲突，并将证据转换成可写入 Neo4j 的属性。返回值：
 
 ```text
-paper       = {id, title, source_file, source_sha256, result_sha256, ...}
+paper       = {id, title, status}
 indicators  = [{id, props}]
 mentions    = [{id: 目标指标ID, props}]
 relations   = [{subject, object, kind: PI或II, predicate, props}]
@@ -322,8 +322,8 @@ make neo4j-import RESULT=outputs/result.json SOURCE="data/paper.md" PAPER_ID=pap
 
 图谱模型只有两类节点：
 
-- `Paper`：论文元数据、抽取状态，以及序列化的章节、过滤章节、归并记录。
-- `Indicator`：论文命名空间内的指标，保存名称、别名、定义、来源章节和指标发现证据。
+- `Paper`：论文 ID、标题、抽取状态，以及导入管理字段 importer、import_lock、imported_at。
+- `Indicator`：论文命名空间内的指标，保存名称、别名、定义和指标发现证据，以及 paper_id、importer。
 
 PI 直接写为 `Paper -[:PROPOSES|MODIFIES|APPLIES]-> Indicator`（每个指标最多一类有效 PI）。II 直接写为指标间的 VARIANT_OF、DERIVED_FROM、IMPROVES_ON、ALTERNATIVE_TO、COMPONENT_OF 边，支持同一对指标的不同关系。ALTERNATIVE_TO 按指标清单顺序保存一次，语义上为对称关系，查询时可忽略箭头方向。
 
@@ -335,18 +335,17 @@ PI 直接写为 `Paper -[:PROPOSES|MODIFIES|APPLIES]-> Indicator`（每个指标
 | paper_id / importer | 来源论文和导入器 |
 | assertion_mode | explicit 或 inferred |
 | rationale_summary | 判断依据摘要及适用条件 |
-| evidence_json | 完整证据数组的 JSON 字符串，包含观察描述、原句和来源位置 |
-| evidence_quotes | 引句或图片链接的字符串数组，方便展示 |
-| evidence_count | 该关系证据条数 |
+| evidence_quotes | 按原证据顺序保存的原文引句或图片 URL 数组 |
+| evidence_observations | 与 evidence_quotes 下标一一对应的观察描述数组；文字证据为空字符串 |
 | status | 保留抽取结果状态，入库不代表语义验证通过 |
 
-证据顺序与原结果一致，保留依据摘要中的证据下标。视觉证据的 quote 是图片 URL，observation 保存在 evidence_json 中。Neo4j 属性不能直接保存嵌套对象数组，因此完整证据序列化保存，不再生成 Assertion、Evidence 节点。指标发现证据保存为 Indicator 的同名 evidence_* 属性，与关系证据分别维护。
+所有关系边（包括 MENTIONS、PI 和 II）必须至少包含一条原文或视觉证据。“证据不足”的 MENTIONS 也须引用指标出现的实际片段，并说明缺少的判断条件；这些片段不证明三大关系不存在。关系边不保存 evidence_json，只保存上述两个对齐的证据数组，保留依据摘要中的证据下标。文字证据的 quote 是原句、observation 为空；视觉证据的 quote 是图片 URL、observation 是观察描述，二者都有值。导入时仍校验原始证据位置，但关系边不再保存 source_spans 等定位信息，完整记录保留在 result.json。Indicator 节点同样只保存 evidence_quotes、evidence_observations，与关系证据分别维护；不保存 candidate_ids、source_chunk_ids、payload_json、local_id 或 evidence_json；不生成 Assertion、Evidence 节点。
 
-每篇论文仍通过辅助 `MENTIONS` 连接全部指标。仅无有效 PI 的 MENTIONS 保存 no_relation_reason、no_relation_detail、rationale_summary 和 evidence_*；有效 PI 的证据只写在实际业务关系上。展示主图时可隐藏 MENTIONS。
+每个指标与论文之间只有一条 PI 或 MENTIONS 边：paper_relations 的 predicate 为 null 时创建 MENTIONS，保存 no_relation_reason、no_relation_detail、rationale_summary 和 evidence_*；predicate 非空时只创建对应的 PROPOSES/MODIFIES/APPLIES 边，不额外创建 MENTIONS。
 
 ### 重复导入与事务
 
-重复导入相同 paper_id，会在单个事务内删除该导入器拥有的旧指标及关联边并重建。也会清理该论文旧版 Assertion/Evidence 节点；其他论文和其他导入器数据不受影响。不会自动删除数据库级旧约束，避免影响其他尚未重导入的论文。自动生成节点上的人工附加关系会随删除重建丢失，请另行保存人工标注。唯一约束单独建立；数据事务失败会回滚，保留此前图谱。
+重复导入相同 paper_id，会在单个事务内删除该导入器拥有的旧指标及关联边并重建。也会清理该论文旧版 Assertion/Evidence 节点；其他论文和其他导入器数据不受影响。重新导入时也会移除 Paper 上旧的 chunks_json、merge_map_json、result_file、result_sha256、skipped_sections_json、source_file、source_sha256；原文件仍保留这些数据。更新导入代码不会自动修改已有数据，需要重新导入对应论文；问答检索兼容旧节点/关系的 evidence_json 和新节点/关系的两个证据数组。不会自动删除数据库级旧约束，避免影响其他尚未重导入的论文。自动生成节点上的人工附加关系会随删除重建丢失，请另行保存人工标注。唯一约束单独建立；数据事务失败会回滚，保留此前图谱。
 
 成功输出论文、指标、MENTIONS、PI/II、无关系记录数量；evidence_entries 是所有节点和关系属性内的证据条目总数，同一证据被多处引用时分别计数。`--dry-run` 不连接数据库，不代表写入成功。
 
@@ -368,7 +367,7 @@ RETURN s, r, o
 ```cypher
 MATCH (p:Paper {id: 'paper-001'})-[r:PROPOSES]->(i:Indicator)
 RETURN i.name, r.relation_id, r.assertion_mode, r.rationale_summary,
-       r.evidence_quotes, r.evidence_json
+       r.evidence_quotes, r.evidence_observations
 ```
 
 查询没有有效 PI 关系的指标及原因：
@@ -376,10 +375,10 @@ RETURN i.name, r.relation_id, r.assertion_mode, r.rationale_summary,
 ```cypher
 MATCH (p:Paper {id: 'paper-001'})-[m:MENTIONS]->(i:Indicator)
 WHERE m.no_relation_reason IS NOT NULL
-RETURN i.name, m.no_relation_reason, m.no_relation_detail, m.evidence_quotes
+RETURN i.name, m.no_relation_reason, m.no_relation_detail, m.evidence_quotes, m.evidence_observations
 ```
 
-前端悬浮关系时可显示 type(r)、assertion_mode 和 evidence_quotes；点击详情时解析 evidence_json，展示全部引句、视觉观察及来源位置。稳定定位使用 relation_id。graph_db 仅负责存储；app 已实现问答及证据卡片，但尚未实现交互图谱的关系悬浮框。Neo4j Browser 不会因属性存在就自动生成定制的悬浮框。
+前端悬浮关系时可显示 type(r)、assertion_mode 和 evidence_quotes；点击详情时按相同下标读取 evidence_quotes 和 evidence_observations，展示引句或图片链接及对应观察描述。稳定定位使用 relation_id。graph_db 仅负责存储；app 已实现问答及证据卡片，但尚未实现交互图谱的关系悬浮框。Neo4j Browser 不会因属性存在就自动生成定制的悬浮框。
 
 ## 3. app：前后端分离的证据问答
 
@@ -426,20 +425,27 @@ Vite 代理 `/api` 到后端，无需开放跨域。后端地址不同时，启�
 
 ### 问答 LangSmith 追踪
 
-问答沿用 IE 的 `LANGSMITH_TRACING`、`LANGSMITH_API_KEY`、`LANGSMITH_PROJECT` 和 `LANGSMITH_ENDPOINT`。在 `.env` 中设置 `LANGSMITH_TRACING=true` 并配置密钥后重启后端即可启用；关闭时不上传追踪。开启但缺少密钥时，后端启动会明确报错。已配置的项目名保持不变，因此使用示例的 `LANGSMITH_PROJECT=ie` 时，问答也进入该项目，以 `qa` 标签区分；未设置项目名时问答默认使用 `qa`。
+问答与 IE 共用 `LANGSMITH_TRACING`、`LANGSMITH_API_KEY` 和 `LANGSMITH_ENDPOINT`，项目名分别使用 `QA_LANGSMITH_PROJECT`（问答）和 `LANGSMITH_PROJECT`（IE）。在 `.env` 中设置 `LANGSMITH_TRACING=true` 并配置密钥后重启后端即可启用；关闭时不上传追踪。开启但缺少密钥时，后端启动会明确报错。
 
-进入问答图后，根运行名为 `qa:chat`，运行 ID 与 SSE `meta.request_id`、前端检索过程中的请求 ID 相同。元数据包含 `paper_id`、`model` 和实际保留的历史轮数 `history_turns`。图中可查看 `plan → retrieve → review → answer` 的实际执行路径、节点输入输出、耗时和异常；三阶段模型调用分别命名为 `deepseek:qa:plan`、`deepseek:qa:review`、`deepseek:qa:answer`，附在对应节点下。流式请求开启 usage 返回以记录供应商提供的 token 用量；取消或提前断流时用量可能不完整。
+```dotenv
+LANGSMITH_PROJECT=ie
+QA_LANGSMITH_PROJECT=qa
+```
+
+`QA_LANGSMITH_PROJECT` 未设置、为空或仅含空白时默认使用 `qa`，不继承 `LANGSMITH_PROJECT`。问答后端启动时将独立项目名映射到其进程内的标准 `LANGSMITH_PROJECT`，使图节点和模型子调用进入同一问答项目；不会改写 `.env` 中的 IE 项目或影响单独启动的 IE 进程。修改后重启 `make qa-backend`，新问答进入新项目，已有追踪记录不迁移。
+
+进入问答图后，根运行名为 `qa:chat`，运行 ID 与 SSE `meta.request_id`、前端检索过程中的请求 ID 相同。元数据包含 `paper_id`、`model` 和实际保留的历史轮数 `history_turns`。图中可查看 `plan → retrieve → answer` 的实际执行路径、节点输入输出、耗时和异常；两个阶段的模型调用分别命名为 `deepseek:qa:plan`、`deepseek:qa:answer`，附在对应节点下。流式请求开启 usage 返回以记录供应商提供的 token 用量；取消或提前断流时用量可能不完整。
 
 启用后，当前问题、保留的历史问答、指标目录、图谱事实、证据和模型输入输出会上传到配置的 LangSmith 服务。目录读取发生在图外；论文不存在、没有指标等未进入图的请求不会产生 `qa:chat` 运行。服务正常关闭时等待已排队的追踪发送，不在每次问答完成时阻塞 SSE。追踪用于诊断，不增加聊天持久化或 checkpoint。接入方式参考 [LangSmith 的 LangGraph 官方说明](https://docs.langchain.com/langsmith/trace-with-langgraph)。
 
 ### 后端 Agent 架构
 
-编排入口是 `backend/agent.py::KnowledgeAgent`。它是有界的工具调用式 Agent：模型负责选择检索工具与参数、判断是否补查、生成回答；代码限制工具集合、论文范围、调用次数并核对引用。`store.py` 执行固定的参数化只读 Cypher，模型不能执行任意查询。
+编排入口是 `backend/agent.py::KnowledgeAgent`。它是有界的工具调用式 Agent：模型负责一次规划检索工具与参数、生成回答；代码限制工具集合、论文范围、调用次数并核对引用。`store.py` 执行固定的参数化只读 Cypher，模型不能执行任意查询。
 
 | 层次 | 文件 | 职责 |
 | --- | --- | --- |
 | API 与流传输 | `backend/main.py` | FastAPI 生命周期、配置、并发限制、工作线程、有界队列、SSE、取消信号 |
-| Agent 与状态 | `backend/agent.py` | LangGraph 四节点编排、模型 token 流、引用校验 |
+| Agent 与状态 | `backend/agent.py` | LangGraph 三节点编排、模型 token 流、引用校验 |
 | 可观测性 | `backend/observability.py` | LangSmith 配置校验、OpenAI 兼容客户端包装、关闭时发送追踪 |
 | 工具实现 | `backend/store.py` | 指标详情、关系、无关系理由三个查询模板 |
 | 模型契约 | `backend/prompts.py`、`backend/schemas.py` | 检索计划、工具参数、结构化回答 |
@@ -452,27 +458,24 @@ Vite 代理 `/api` 到后端，无需开放跨域。后端地址不同时，启�
 flowchart TD
     S[加载论文与指标目录] --> P[plan：选择工具与参数]
     P -->|有工具调用| R[retrieve：执行只读检索]
-    P -->|无调用或需澄清| A[answer]
-    R -->|首轮完成| V[review：判断是否补查]
-    V -->|有新的工具调用| R
-    V -->|足够或需澄清| A
-    R -->|第二轮完成| A
+    P -->|无工具调用或需用户澄清问题| A[answer]
+    R --> A
     A --> G[流式生成并核对引用]
     G --> E[结束]
 ```
 
 | State 字段 | 内容 |
 | --- | --- |
-| history | 同一论文已完成问答，供规划、补查与回答理解指代；不作为事实证据 |
+| history | 同一论文已完成问答，供规划与回答理解指代；不作为事实证据 |
 | question、paper、catalog | 用户问题、选定论文、用于名称/别名匹配的指标目录 |
 | plan | explanation、clarification、calls；工具调用只能引用目录中的指标 ID |
 | facts | 工具取回的事实，包含稳定 ID 与 citation_ids |
 | sources | E1 等本次请求内的引用编号、事实 ID、论文和原始 evidence |
-| trace、seen_calls、rounds | 工具执行记录、已调用参数、检索轮次 |
-| warnings | 检索数量或上下文截断等覆盖范围提示 |
-| answer | status、claims、limitation、follow_up |
+| trace | 工具执行记录；不维护 seen_calls，不按调用历史拦截查询 |
+| warnings | 保留的提示字段；当前不再产生目录、历史或检索上下文截断提示 |
+| answer | message、claims |
 
-模型的 Plan 最多给出三个调用；review 在首轮后运行一次，有缺口时再查一轮。clarification 非空时跳过工具直接询问用户；没有事实时直接返回资料不足，不调用回答模型。当前图最多三次模型请求：plan、review、answer；retrieve 本身只查询数据库，不调用模型。
+模型的 Plan 一次最多给出三个调用，retrieve 依次执行后直接进入 answer，不根据中间结果动态补查。clarification 非空时跳过工具直接询问用户；查询已执行但没有事实时，仍调用回答模型，根据用户问题与 trace 直接说明论文没有对应内容，以 message 流式输出，不附加重试建议，也不进行证据引用校验；仅检查空结果回答没有伪造 claims 且 message 非空。未执行查询且没有事实时，按规划说明无法查询的原因。只有未执行查询的情况不调用回答模型。当前图最多两次模型请求：plan、answer；retrieve 本身只查询数据库，不调用模型。资料不足时回答说明局限或建议用户明确范围。
 
 ### 前后端与流式数据流
 
@@ -484,15 +487,14 @@ flowchart TD
     C --> D[LLM 规划：选择检索工具及参数]
     D --> E[固定 Cypher：指标详情 / PI和II关系 / 无关系理由]
     E --> F[返回事实及完整证据，生成引用编号]
-    F --> G{LLM 判断是否需补查}
-    G -->|需要，最多补查一轮| E
-    G -->|足够或达到两轮| H[LLM 基于图谱事实生成回答]
+    F --> H[LLM 基于图谱事实生成回答]
+    D -->|需要澄清或无可用查询| K[直接返回澄清或资料不足]
     H -. token 增量预览 .-> V[Vue 回答中：引用待核对]
     H --> I[核对事实 ID、引用归属、推断标记]
     I --> J[Vue 展示回答、证据卡片和工具调用记录]
 ```
 
-这是 Agentic Graph-RAG：模型根据问题选择工具，可依缺口补查，最终生成回答。并非向量检索，也不是让模型直接执行任意 Cypher。支持多轮追问：前端携带当前论文最近 12 轮已完成问答，后端按 24,000 字符预算保留最近可完整容纳的历史，超限会提示。历史问题、正式回答及澄清内容用于理解指代，历史事实与证据编号不直接复用；本轮仍重新检索并核验引用。失败或取消的草稿不进入历史。切换论文、清空会话或刷新页面会重置上下文，服务端不持久化聊天。
+这是 Agentic Graph-RAG：模型根据问题自主选择工具和参数，在单轮内执行计划中的查询，最终生成回答；不包含迭代复核或自动补查。并非向量检索，也不是让模型直接执行任意 Cypher。支持多轮追问：前端携带当前论文当前会话全部已完成问答，后端不再按轮数或字符数截断历史。历史问题、正式回答及澄清内容用于理解指代，历史事实与证据编号不直接复用；本轮仍重新检索并核验引用。失败或取消的草稿不进入历史。切换论文、清空会话或刷新页面会重置上下文，服务端不持久化聊天。
 
 流式草稿、正式回答、证据原文、视觉观察、问题和检索说明统一使用 [vue-markdown-renderer](https://github.com/linzhe141/vue-markdown-renderer) 的 npm 包 `vue-mdr` 渲染，配合 remark-math 与 KaTeX 显示 `$...$` / `$$...$$` 公式，并支持列表、表格和代码块。原始 HTML 不启用；证据内容仅改变显示方式，溯源位置仍对应原文。
 
@@ -502,9 +504,9 @@ flowchart TD
 - relations：关联指定指标的入边和出边，可按 PI/II 类型筛选；保留实际起点、终点与条件摘要。
 - no_relation：无有效 PI 判定的原因及证据。
 
-每轮最多 3 次工具调用，最多 2 轮；避免重复调用；每次查询最多 40 条，超过上限时返回覆盖警告。选定论文的指标目录最多 500 条，论文选择列表最多 200 篇。证据上下文约 65,000 字符，按完整记录纳入，超限不截断原句而省略整条并给出警告。以上限制意味着宽泛问题的回答可能不完整，宜按指标细化问题。
+每轮最多 3 次工具调用，最多 2 轮；允许同一工具使用不同参数再次查询，也允许重复相同参数的调用，程序按 calls 顺序执行，不进行调用去重。三个检索工具不设置查询条数上限，返回全部符合筛选条件的记录；Agent 按事实 ID 去重后完整保留记录及证据，不因内容长度省略或截取。已移除检索上下文字符阈值，完整传递事实与证据；工具事件中的 `truncated` 保持为 false。模型服务自身的上下文窗口限制仍然有效，超出可能导致请求失败。`catalog(paper_id)` 返回该论文全部指标，指标别名也完整保留，不再限制为 500 个指标或每个指标 10 个别名。论文选择列表仍最多 200 篇；完整返回已入库数据不等于图谱覆盖了论文全部信息。
 
-回答由 claims 构成，每条都引用检索事实和证据编号。后端确认引用存在、属于指定事实且每条引用事实都有对应证据；任何引用的事实是 inferred，则回答也标记推断。证据不足不会凭空补答案。部分图谱记录没有原文证据时，引用明确标记为图谱属性记录，不冒充论文原句。本轮未调用视觉模型，视觉卡片展示的是抽取阶段已有 observation，可点击查看原图。
+回答由 claims 构成，每条都引用检索事实和证据编号。后端确认引用存在、属于指定事实且每条引用事实都有对应证据；任何引用的事实是 inferred，则回答也标记推断。证据不足不会凭空补答案。检索结果必须有有效的原文或视觉证据；缺失或无效时拒绝回答并提示重新抽取、导入，不再生成 graph_record 占位证据。回答的 graph_record 标签仍用于定义和无关系判定，表示结论类型而非证据缺失。本轮未调用视觉模型，视觉卡片展示的是抽取阶段已有 observation，可点击查看原图。
 
 引用核对只能保证来源关联，不能自动证明模型解释的语义正确。正文统一通过 Markdown 组件渲染，关闭原始 HTML 并保留内容清理；本地 source_file 仅展示，不提供任意文件读取接口。
 
@@ -512,7 +514,7 @@ flowchart TD
 
 - `GET /api/health`：数据库连通性、模型是否已配置（不等于模型服务可用）。
 - `GET /api/papers`：已导入论文列表和是否截断。
-- `POST /api/chat`：发送 `{ "paper_id": "paper-001", "question": "本文提出了哪些指标？", "history": [] }`。`history` 可省略；后续请求按时间顺序附带最多 12 个 `{question, answer}`，其中 `answer` 是之前 `done` 事件中的正式回答。
+- `POST /api/chat`：发送 `{ "paper_id": "paper-001", "question": "本文提出了哪些指标？", "history": [] }`。`history` 可省略；后续请求按时间顺序附带当前会话全部 `{question, answer}`，其中 `answer` 是之前 `done` 事件中的正式回答。
 
 响应为 `text/event-stream`，通过 POST fetch 读取。事件格式：
 
@@ -525,15 +527,17 @@ data: {"stage":"thinking","label":"思考中","detail":"识别指标与选择检
 | 事件 | 含义 |
 |---|---|
 | meta | 本次 request_id |
-| status | 读取论文、思考、查询图谱、复核补查、回答、核对引用等实际执行阶段 |
+| status | 读取论文、思考、查询图谱、回答、核对引用等实际执行阶段 |
 | plan | 简短检索目的与工具计划，不是模型内部思维链 |
-| tool_start / tool_end | 工具、轮次、返回数量及是否截断 |
+| tool_start / tool_end | 工具、返回数量及是否截断 |
 | sources | 累计证据和来源，可在回答生成前查看 |
 | draft | 从模型真实 token 流增量解析的回答文字预览，尚未完成引用校验 |
 | done | 完整且通过引用归属检查的结构化回答，替换预览 |
 | error | 请求中途失败，前端清除未完成预览并保留失败轨迹 |
 
-思考阶段不转发供应商 reasoning_content。回答不是预先生成后模拟打字：后端读取供应商 token 流，经 LangGraph custom 事件和 SSE 逐步发送；前端对 UTF-8 和事件边界进行增量解码。draft 暂不展示尚未验证的引用或“原文明示”标记。done 包含 paper、answer、facts、sources、trace、warnings；request_id 来自 meta。answer 包含 status（answered/insufficient/clarification）、claims、limitation、follow_up，每条 claim 包含 text、assertion_mode、fact_ids、citation_ids。
+前端流程列表仅按接收顺序展示后端 `status` 事件中的 label、detail，不将 plan、tool_start、tool_end 额外转换成流程步骤。完成、失败或停止只更新整体状态，不追加流程项；工具记录仍保留在返回结果的 trace 中。
+
+思考阶段不转发供应商 reasoning_content。回答不是预先生成后模拟打字：后端读取供应商 token 流，经 LangGraph custom 事件和 SSE 逐步发送；前端对 UTF-8 和事件边界进行增量解码。draft 暂不展示尚未验证的引用或“原文明示”标记。done 包含 paper、answer、facts、sources、trace、warnings；request_id 来自 meta。answer 包含 message（澄清问题、空查询结论或回答范围说明）、claims，每条 claim 包含 text、assertion_mode、fact_ids、citation_ids。
 
 请求开始前可返回 422（参数错误）、429（并发超过两个）或 503（配置未就绪）。流建立后，数据库、论文不存在、模型或校验异常都通过 error 事件发送，不能再改变 HTTP 状态。前端将缺少 done 的连接终止视为失败，不把部分回答当作成功。
 

@@ -37,16 +37,14 @@ def build_payload(result_path: Path, source: Path, paper_id=None, title=None):
     # title，依次使用函数传入的、md的一级标题中提取、文件名
     title = title or next((line[2:].strip() for line in raw.splitlines() if line.startswith("# ")), source.stem)
     
-    paper = dict(id=paper_id, title=title, source_file=str(source.resolve()),
-                 source_sha256=source_hash, result_file=str(result_path.resolve()),
-                 result_sha256=digest(result_bytes), status=data["status"],
-                 merge_map_json=encode(data["merge_map"]), chunks_json=encode(data["chunks"]),
-                 skipped_sections_json=encode(data["skipped_sections"]))
+    paper = dict(id=paper_id, title=title, status=data["status"])
     indicators, relations, mentions = [], [], []
     known = {}
 
     def evidence_props(items):
-        # 保持证据数组顺序及下标，完整保存文字、视觉和多位置溯源。
+        if not isinstance(items, list) or not items:
+            raise ValueError("指标节点和关系边必须至少提供一条证据，请重新抽取")
+        # 入库前仍校验原始证据及位置；节点和关系边只保存对齐的引句和观察数组。
         for item in items:
             Evidence.model_validate({k: v for k, v in item.items() if k in Evidence.model_fields})
             if item.get("source_file") and Path(item["source_file"]).resolve() != source.resolve():
@@ -55,9 +53,8 @@ def build_payload(result_path: Path, source: Path, paper_id=None, title=None):
                 a, b = span["start"], span["end"]
                 if not 0 <= a < b <= len(raw) or raw[a:b] != span["quote"]:
                     raise ValueError("证据位置与当前 Markdown 不一致，请使用抽取时的原文")
-        return {"evidence_json": encode(items),
-                "evidence_quotes": [item["quote"] for item in items],
-                "evidence_count": len(items)}
+        return {"evidence_quotes": [item["quote"] for item in items],
+                "evidence_observations": [item.get("observation") or "" for item in items]}
 
     # 遍历指标，整理指标属性放入数组中得到指标节点。
     for item in data["indicators"]:
@@ -67,11 +64,11 @@ def build_payload(result_path: Path, source: Path, paper_id=None, title=None):
         if not isinstance(item["name"], str) or not item["name"].strip():
             raise ValueError(f"指标名称为空：{iid}")
         known[iid] = paper_id + ":indicator:" + iid
-        props = {k: item.get(k, []) for k in ("aliases", "definitions", "source_chunk_ids", "candidate_ids")}
+        props = {k: item.get(k, []) for k in ("aliases", "definitions")}
         for key, value in props.items():
             if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
                 raise ValueError(f"{iid}.{key} 必须是字符串数组")
-        props.update(local_id=iid, name=item["name"], payload_json=encode(item))
+        props.update(name=item["name"])
         props.update(evidence_props(item["evidence"]))
         indicators.append(dict(id=known[iid], props=props))
 
@@ -92,28 +89,28 @@ def build_payload(result_path: Path, source: Path, paper_id=None, title=None):
                               predicate=row["predicate"], props=props))
 
     covered = set()
-    # 遍历论文关系，整理关系属性放入数组中得到关系节点。
+    # 每个指标只生成一条 PI 边：有效语义关系或 MENTIONS。
     for row in data["paper_relations"]:
         iid = row["indicator_id"]
         if iid not in known or iid in covered:
             raise ValueError(f"PI 未知或重复指标：{iid}")
         covered.add(iid)
         evidence = validate_relation(row, PaperRelation)
-        props = relation_props(paper_id, "MENTIONS", known[iid])
         # 如果没有语义关系，则在 MENTIONS 关系上添加原因及证据属性。
         if row["predicate"] is None:
+            props = relation_props(paper_id, "MENTIONS", known[iid])
             props.update(evidence, no_relation_reason=row["no_relation_reason"],
                          no_relation_detail=row["no_relation_detail"],
                          rationale_summary=row.get("rationale_summary"))
-        mentions.append(dict(id=known[iid], props=props))
+            mentions.append(dict(id=known[iid], props=props))
         # 如果有语义关系，则添加到关系数组中
-        if row["predicate"] is not None:
+        else:
             add_relation(row, paper_id, known[iid], "PI", evidence)
     if covered != set(known):
         raise ValueError(f"PI 未覆盖指标：{sorted(set(known) - covered)}")
     seen = set()
     order = {iid: n for n, iid in enumerate(known)}
-    # 遍历指标关系，整理关系属性放入数组中得到关系节点。
+    # 遍历指标关系，整理关系边属性。
     for row in data["indicator_relations"]:
         a, b, predicate = row["subject_id"], row["object_id"], row["predicate"]
         if a not in known or b not in known or a == b:
@@ -151,7 +148,9 @@ def _replace_paper(tx, payload):
     # 同时清理该论文旧版 Assertion/Evidence 节点，其他论文及其他来源不受影响。
     tx.run("MATCH (n) WHERE n.paper_id=$id AND n.importer=$owner "
            "AND (n:Indicator OR n:Assertion OR n:Evidence) DETACH DELETE n", id=pid, owner=OWNER).consume()
-    tx.run("MATCH (p:Paper {id:$id}) SET p += $props, p.imported_at=datetime()",
+    tx.run("MATCH (p:Paper {id:$id}) SET p += $props, p.imported_at=datetime() "
+           "REMOVE p.chunks_json, p.merge_map_json, p.result_file, p.result_sha256, "
+           "p.skipped_sections_json, p.source_file, p.source_sha256",
            id=pid, props=payload["paper"]).consume()
     tx.run("UNWIND $rows AS row CREATE (n:Indicator {id:row.id}) "
            "SET n += row.props, n.paper_id=$id, n.importer=$owner",
@@ -176,7 +175,7 @@ def payload_summary(payload):
             "ii_relations": sum(r["kind"] == "II" for r in payload["relations"]),
             "no_relation": sum(r["props"].get("no_relation_reason") is not None for r in payload["mentions"]),
             # 统计各属性数组内的证据条目，跨关系重复引用分别计数，并非证据节点数。
-            "evidence_entries": sum(r["props"].get("evidence_count", 0)
+            "evidence_entries": sum(len(r["props"].get("evidence_quotes", []))
                                     for key in ("indicators", "mentions", "relations") for r in payload[key])}
 
 
